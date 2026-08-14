@@ -17,6 +17,8 @@ LX Music 音源一键导入 / 更新工具
 5. 一键全部导入 / 更新
 6. 备份管理：手动生成备份、一键还原备份、查看 / 删除 / 清空备份；所有写操作前自动备份
 7. 已导入音源查看：列表展示 + 详情查看，支持删除所选 / 一键清除全部
+8. GitHub 订阅：添加仓库订阅，一键检查并下载最新 Release 音源，自动以更新模式导入
+9. 镜像切换与 IDM：支持 GitHub 镜像前缀加速下载（国内网络友好）；检测到 IDM 时自动调起 IDM 下载，可手动切换内置下载
 
 实现说明
 --------
@@ -47,6 +49,14 @@ import zlib
 import base64
 import shutil
 import random
+import io
+import zipfile
+import queue
+import threading
+import subprocess
+import tempfile
+import urllib.request
+import urllib.error
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
@@ -84,6 +94,50 @@ LOG_COLORS = {
 }
 
 
+class WebCheck(tk.Canvas):
+    """网页风格复选框：小方框 + 对勾，支持悬停反馈（替代系统 Checkbutton）。"""
+
+    def __init__(self, master, variable=None, command=None, size=18, colors=None):
+        self._size = size
+        self._colors = colors or PALETTE
+        self.var = variable if variable is not None else tk.BooleanVar(value=False)
+        self._command = command
+        self._hover = False
+        try:
+            bg = master.cget('bg')
+        except Exception:
+            bg = PALETTE['card']
+        super().__init__(master, width=size, height=size, bg=bg,
+                         highlightthickness=0, bd=0, cursor='hand2')
+        self.bind('<Button-1>', self._on_click)
+        self.bind('<Enter>', lambda e: self._set_hover(True))
+        self.bind('<Leave>', lambda e: self._set_hover(False))
+        self.var.trace_add('write', lambda *a: self._draw())
+        self._draw()
+
+    def _on_click(self, _e):
+        self.var.set(not self.var.get())
+        if self._command:
+            self._command()
+
+    def _set_hover(self, h):
+        self._hover = h
+        self._draw()
+
+    def _draw(self):
+        c = self
+        c.delete('all')
+        s = self._size
+        if self.var.get():
+            c.create_rectangle(1.5, 1.5, s - 1.5, s - 1.5, fill=self._colors['accent'],
+                               outline=self._colors['accent'], width=1)
+            c.create_line(5, s / 2 + 0.5, s / 2 - 1, s - 5, s - 5, 5,
+                          fill='#fffaf5', width=2, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+        else:
+            outline = self._colors['hover'] if self._hover else self._colors['faint']
+            c.create_rectangle(1.5, 1.5, s - 1.5, s - 1.5, fill='', outline=outline, width=1)
+
+
 def short(text, n):
     """文本截断（None 安全）。"""
     text = '' if text is None else str(text)
@@ -100,10 +154,8 @@ def hex_rgb(h):
     return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def read_text_auto(path):
-    """按多种编码尝试读取文本文件，返回 (文本, 编码)。"""
-    with open(path, 'rb') as f:
-        data = f.read()
+def decode_script_bytes(data):
+    """按多种编码尝试解码脚本字节，返回 (文本, 编码)。"""
     if data.startswith(b'\xff\xfe') or data.startswith(b'\xfe\xff'):
         try:
             return data.decode('utf-16'), 'utf-16'
@@ -115,6 +167,12 @@ def read_text_auto(path):
         except UnicodeError:
             continue
     return data.decode('latin-1'), 'latin-1'
+
+
+def read_text_auto(path):
+    """按多种编码尝试读取文本文件，返回 (文本, 编码)。"""
+    with open(path, 'rb') as f:
+        return decode_script_bytes(f.read())
 
 
 def compress_script(raw):
@@ -138,12 +196,8 @@ def default_user_api_path():
 
 
 def default_backup_dir():
-    base = os.path.dirname(os.path.abspath(sys.argv[0]))
-    cands = [
-        os.path.join(base, 'lx_backups'),
-        os.path.join(os.environ.get('LOCALAPPDATA', base), 'LXMusicTool', 'backups'),
-    ]
-    for cand in cands:
+    base = os.path.join(config_dir(), 'backups')
+    for cand in (base, os.path.join(os.environ.get('LOCALAPPDATA', base), 'LXMusicTool', 'backups')):
         try:
             os.makedirs(cand, exist_ok=True)
             probe = os.path.join(cand, '.probe')
@@ -153,7 +207,33 @@ def default_backup_dir():
             return cand
         except Exception:
             continue
-    return os.path.join(base, 'lx_backups')
+    return base
+
+
+def default_download_dir():
+    """默认订阅下载目录：系统下载目录下的 lxsubscribe。"""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r'Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders') as k:
+            dl = winreg.QueryValueEx(k, '{374DE290-123F-4565-9164-39C4925E467B}')[0]
+        if dl and os.path.isdir(dl):
+            return os.path.join(dl, 'lxsubscribe')
+    except Exception:
+        pass
+    home = os.path.expanduser('~')
+    for cand in (os.path.join(home, 'Downloads'), os.path.join(home, '下载')):
+        if os.path.isdir(cand):
+            return os.path.join(cand, 'lxsubscribe')
+    return os.path.join(config_dir(), 'downloads')
+
+
+def effective_backup_dir(settings):
+    return (settings.get('backup_dir') or '').strip() or os.path.join(config_dir(), 'backups')
+
+
+def effective_download_dir(settings):
+    return (settings.get('download_dir') or '').strip() or default_download_dir()
 
 
 def load_user_api(path):
@@ -255,7 +335,7 @@ def scan_source_folder(folder):
     """遍历文件夹及所有子文件夹，识别全部 .js 音源脚本。"""
     found = []
     for root, dirs, files in os.walk(folder):
-        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules',)]
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ('node_modules', 'history')]
         for fn in sorted(files):
             if fn.lower().endswith('.js'):
                 found.append(os.path.join(root, fn))
@@ -267,6 +347,274 @@ def scan_source_folder(folder):
         meta_missing = _BLOCK_RE.match(text) is None
         sources.append(SourceScript(full, rel, text, meta, enc, meta_missing))
     return sources
+
+
+# ---------------------------------------------------------------- GitHub Release 订阅
+GITHUB_API = 'https://api.github.com'
+_GITHUB_HEADERS = {'User-Agent': 'lx-music-source-manager', 'Accept': 'application/vnd.github+json'}
+
+
+def parse_repo_ref(text):
+    """把 'owner/repo' 或完整仓库链接解析成 (owner, repo)。"""
+    text = (text or '').strip()
+    text = re.sub(r'^https?://[^/]+/', '', text)
+    parts = [p for p in text.split('/') if p]
+    if len(parts) < 2:
+        raise ValueError('无法识别的 GitHub 仓库，请使用 owner/repo 或完整仓库链接')
+    return parts[0], parts[1]
+
+
+def _gh_get(url, timeout=20):
+    req = urllib.request.Request(mirrored_url(url), headers=_GITHUB_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode('utf-8'))
+
+
+def fetch_latest_release(owner, repo, timeout=20):
+    """获取仓库最新 Release（GitHub 官方 API，无需登录，匿名限额 60 次/小时）。"""
+    try:
+        return _gh_get('{}/repos/{}/{}/releases/latest'.format(GITHUB_API, owner, repo), timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ValueError('仓库不存在，或尚未发布过 Release')
+        raise ConnectionError('GitHub API 返回 HTTP {}'.format(e.code))
+    except urllib.error.URLError as e:
+        raise ConnectionError('网络错误：{}'.format(e.reason))
+
+
+def download_bytes(url, timeout=30):
+    """下载 Release 附件（自动跟随跳转；设置了镜像时走镜像前缀）。"""
+    req = urllib.request.Request(mirrored_url(url), headers=_GITHUB_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def source_assets_of(release):
+    """筛出 Release 附件中可能包含音源脚本的（.js 或 .zip）。"""
+    out = []
+    for a in release.get('assets') or []:
+        if a.get('name', '').lower().endswith(('.js', '.zip')):
+            out.append(a)
+    return out
+
+
+def _safe_extract_zip(zip_path, dest):
+    """安全解压 zip 到目标目录（拦截路径穿越）。"""
+    base = os.path.normcase(os.path.abspath(dest)) + os.sep
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            name = info.filename.replace('\\\\', '/')
+            if name.startswith('/') or '..' in name.split('/'):
+                continue
+            target = os.path.normcase(os.path.abspath(os.path.join(dest, name)))
+            if not target.startswith(base):
+                continue
+            if info.is_dir():
+                os.makedirs(target, exist_ok=True)
+            else:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with open(target, 'wb') as f:
+                    f.write(zf.read(info))
+
+
+def _extract_js_from_zip(data, cap=20 * 1024 * 1024):
+    """从 zip 内存数据中提取所有 .js 文件，返回 [(文件名, bytes)]。"""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except Exception:
+        raise ValueError('附件不是有效的 zip 文件')
+    out = []
+    total = 0
+    for info in zf.infolist():
+        if info.is_dir() or not info.filename.lower().endswith('.js'):
+            continue
+        if info.file_size > cap:
+            continue
+        total += info.file_size
+        if total > cap:
+            raise ValueError('zip 解压内容过大，已中止')
+        out.append((info.filename, zf.read(info)))
+    if not out:
+        raise ValueError('zip 内没有找到 .js 音源文件')
+    return out
+
+
+def scripts_from_asset(asset, src_label):
+    """下载一个 Release 附件（.js 或 .zip），解析出其中的全部音源脚本。"""
+    name = asset.get('name', '')
+    data = download_bytes(asset['browser_download_url'])
+    if name.lower().endswith('.zip'):
+        items = _extract_js_from_zip(data)
+    else:
+        items = [(name, data)]
+    scripts = []
+    for fname, content in items:
+        text, enc = decode_script_bytes(content)
+        meta = parse_script_meta(text, fallback_name=os.path.splitext(fname)[0])
+        scripts.append(SourceScript(src_label, fname, text, meta, enc, _BLOCK_RE.match(text) is None))
+    return scripts
+
+
+def tool_dir():
+    return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def config_dir():
+    """配置文件夹：所有配置/日志/备份集中存放，避免散落在 exe 旁边。"""
+    d = os.path.join(tool_dir(), 'config')
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def subscriptions_path():
+    return os.path.join(config_dir(), 'subscriptions.json')
+
+
+def settings_path():
+    return os.path.join(config_dir(), 'settings.json')
+
+
+def logs_path():
+    return os.path.join(config_dir(), 'logs', 'app.log')
+
+
+DEFAULT_SETTINGS = {
+    'mirror': '',
+    'use_idm': True,
+    'backup_enabled': True,
+    'backup_dir': '',
+    'download_dir': '',
+    'keep_history': False,
+    'log_enabled': True,
+    'log_window': True,
+}
+
+
+def load_subscriptions():
+    """读取订阅状态文件（工具目录下的 subscriptions.json）。"""
+    try:
+        with open(subscriptions_path(), encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data = data.get('subscriptions', [])
+        if isinstance(data, list):
+            return [s for s in data if isinstance(s, dict)]
+        return []
+    except Exception:
+        return []
+
+
+def save_subscriptions(subs):
+    p = subscriptions_path()
+    os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+    try:
+        with open(p, encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    data['subscriptions'] = subs
+    tmp = p + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+
+def load_settings():
+    """读取全部工具设置（config/settings.json）。"""
+    data = {}
+    try:
+        with open(settings_path(), encoding='utf-8') as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            data = d
+    except Exception:
+        pass
+    out = dict(DEFAULT_SETTINGS)
+    for k in DEFAULT_SETTINGS:
+        if k in data and data[k] is not None:
+            out[k] = data[k]
+    return out
+
+
+def save_settings(settings):
+    p = settings_path()
+    os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+    tmp = p + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(settings, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+
+# ---------------------------------------------------------------- 镜像前缀与 IDM
+_MIRROR = ''
+
+
+def set_mirror(m):
+    """设置镜像前缀（如 ghfast.top），空值表示直连；自动补 https:// 并去掉尾部斜杠。"""
+    global _MIRROR
+    m = (m or '').strip().rstrip('/')
+    if m and not m.startswith(('http://', 'https://')):
+        m = 'https://' + m
+    _MIRROR = m
+
+
+def get_mirror():
+    return _MIRROR
+
+
+def mirrored_url(url):
+    """给原始 URL 加镜像前缀（ghproxy 系格式：镜像/https://原地址）。"""
+    if _MIRROR:
+        return _MIRROR + '/' + url
+    return url
+
+
+def find_idm_path():
+    """探测 IDM（Internet Download Manager）的 IDMan.exe 路径，未安装返回 None（结果缓存）。"""
+    if find_idm_path._cached is not None:
+        return find_idm_path._cached
+    found = None
+    try:
+        import winreg
+        for key in (r'SOFTWARE\Internet Download Manager', r'SOFTWARE\WOW6432Node\Internet Download Manager'):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key) as k:
+                    d = winreg.QueryValueEx(k, 'InstallDir')[0]
+                p = os.path.join(d, 'IDMan.exe')
+                if os.path.isfile(p):
+                    found = p
+                    break
+            except OSError:
+                continue
+    except Exception:
+        pass
+    if not found:
+        for base in (os.environ.get('ProgramFiles(x86)', ''), os.environ.get('ProgramFiles', '')):
+            p = os.path.join(base, 'Internet Download Manager', 'IDMan.exe')
+            if os.path.isfile(p):
+                found = p
+                break
+    if not found:
+        try:
+            out = subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 '(Get-Process IDMan -ErrorAction SilentlyContinue | Select-Object -First 1).Path'],
+                capture_output=True, text=True, timeout=10)
+            p = (out.stdout or '').strip()
+            if p and os.path.isfile(p):
+                found = p
+        except Exception:
+            pass
+    find_idm_path._cached = found
+    return found
+
+
+find_idm_path._cached = None
 
 
 def apply_imports(entries, sources, mode):
@@ -385,8 +733,12 @@ class BackupManager:
 class BaseApp:
     def __init__(self, user_api_path=None, backup_dir=None, auto_confirm=False):
         self.auto_confirm = auto_confirm
+        self.settings = load_settings()
+        set_mirror(self.settings['mirror'])
+        self.use_idm = bool(self.settings['use_idm'])
+        self.idm_path = find_idm_path()
         self.user_api_path = user_api_path if user_api_path is not None else default_user_api_path()
-        self.backup_dir = backup_dir if backup_dir is not None else default_backup_dir()
+        self.backup_dir = backup_dir if backup_dir is not None else effective_backup_dir(self.settings)
         self.backups = BackupManager(self.backup_dir)
         self.entries = []
         self.candidates = []
@@ -396,12 +748,27 @@ class BaseApp:
         self.candidate_filter = ''
         self.import_mode = 'add'
         self.last_folder = os.path.expanduser('~')
+        self.subscriptions = load_subscriptions()
+        self.checked_subs = set()
+        self._current_sub = None
+        self._settings_win = None
         self._load_data()
         self._view_refresh_backups()
+        self._view_refresh_subscriptions()
+        self._view_refresh_candidates()
 
     # ---------------- 日志 / 提示 ----------------
     def log(self, text, level='info'):
-        self._view_log('[{}] {}'.format(time.strftime('%H:%M:%S'), text), level)
+        line = '[{}] {}'.format(time.strftime('%H:%M:%S'), text)
+        self._view_log(line, level)
+        if self.settings.get('log_enabled', True):
+            try:
+                p = logs_path()
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, 'a', encoding='utf-8') as f:
+                    f.write(time.strftime('[%Y-%m-%d %H:%M:%S] ') + text + '\n')
+            except Exception:
+                pass
 
     def _confirm(self, title, message, danger=False):
         if self.auto_confirm:
@@ -447,6 +814,8 @@ class BaseApp:
         self._view_set_status('数据文件：{}  [{}]    备份目录：{}    修改后需重启 LX Music 生效'.format(p or '(未定位)', w, self.backup_dir))
 
     def _auto_backup(self):
+        if not self.settings.get('backup_enabled', True):
+            return True
         try:
             p = self.backups.create(self.user_api_path, reason='auto')
             self.log('已自动备份：{}'.format(os.path.basename(p)), 'info')
@@ -700,6 +1069,500 @@ class BaseApp:
         self._view_refresh_backups()
         self.log('已还原备份「{}」，重启 LX Music 后生效'.format(name), 'ok')
 
+    # ---------------- GitHub 订阅 ----------------
+    def _run_task(self, fn, on_done, busy_label='处理中…'):
+        """后台线程执行 fn，完成后在主线程回调 on_done(ok, result_or_error)。"""
+        self.log(busy_label, 'info')
+        q = queue.Queue()
+        threading.Thread(target=lambda: self._task_worker(fn, q), daemon=True).start()
+        self._poll_task(q, on_done)
+
+    def _task_worker(self, fn, q):
+        try:
+            q.put(('ok', fn()))
+        except Exception as e:
+            q.put(('err', str(e)))
+
+    def _poll_task(self, q, on_done):
+        try:
+            item = q.get_nowait()
+        except queue.Empty:
+            try:
+                self.root.after(150, lambda: self._poll_task(q, on_done))
+            except Exception:
+                pass
+            return
+        try:
+            on_done(*item)
+        except Exception as e:
+            self.log('任务回调异常：{}'.format(e), 'error')
+
+    def do_add_subscription(self, repo_ref=None):
+        if repo_ref is None:
+            repo_ref = self._view_input('添加订阅', '请输入 GitHub 仓库：\n\n格式：owner/repo，或完整仓库链接（https://github.com/xxx/yyy）')
+        if not repo_ref:
+            return
+        try:
+            owner, repo = parse_repo_ref(repo_ref)
+        except ValueError as e:
+            self._info('无法添加', str(e))
+            return
+        key = '{}/{}'.format(owner, repo)
+        if any(s.get('repo') == key for s in self.subscriptions):
+            self._info('提示', '该仓库已在订阅列表中')
+            return
+
+        def fetch():
+            return fetch_latest_release(owner, repo)
+
+        def done(ok, payload):
+            if not ok:
+                self._info('添加失败', '无法获取该仓库的最新 Release：\n{}'.format(payload))
+                return
+            rel = payload
+            assets = source_assets_of(rel)
+            if not assets:
+                self._info('添加失败', '最新版本「{}」的附件中没有 .js / .zip 音源'.format(rel.get('tag_name', '?')))
+                return
+            sub = {'repo': key, 'name': key, 'last_tag': '', 'asset_names': [a['name'] for a in assets],
+                   'added_at': time.strftime('%Y-%m-%d %H:%M:%S')}
+            self.subscriptions.append(sub)
+            save_subscriptions(self.subscriptions)
+            self._view_refresh_subscriptions()
+            self.log('已添加订阅：{}（最新 {}，附件 {} 个）'.format(key, rel.get('tag_name'), len(assets)), 'ok')
+            if self._confirm('立即下载并导入？', '是否立即下载「{}」的最新版本并导入？\n\n当前最新版本：{}'.format(key, rel.get('tag_name'))):
+                self.do_update_subscription(sub)
+
+        self._run_task(fetch, done, '正在查询 {} 的最新 Release…'.format(key))
+
+    def do_check_subscriptions(self):
+        if not self.subscriptions:
+            self._info('提示', '尚未添加任何订阅，请先点「添加订阅」')
+            return
+        subs = list(self.subscriptions)
+
+        def work():
+            out = []
+            for sub in subs:
+                try:
+                    rel = fetch_latest_release(*sub['repo'].split('/'))
+                    out.append((sub, 'ok', rel.get('tag_name', '?')))
+                except Exception as e:
+                    out.append((sub, 'err', str(e)))
+            return out
+
+        def done(ok, payload):
+            if not ok:
+                self.log('检查订阅失败：{}'.format(payload), 'error')
+                return
+            for sub, kind, info in payload:
+                if kind == 'err':
+                    self.log('「{}」检查失败：{}'.format(sub['repo'], info), 'error')
+                elif sub.get('last_tag') and info == sub.get('last_tag'):
+                    self.log('「{}」已是最新：{}'.format(sub['repo'], info), 'ok')
+                else:
+                    self.log('「{}」发现新版本：最新 {}（本地已用 {}）'.format(sub['repo'], info, sub.get('last_tag') or '无'), 'update')
+
+        self._run_task(work, done, '正在检查全部订阅…')
+
+    def do_update_subscription(self, sub):
+        def work():
+            return fetch_latest_release(*sub['repo'].split('/'))
+
+        def done(ok, payload):
+            if not ok:
+                self.log('「{}」更新失败：{}'.format(sub['repo'], payload), 'error')
+                self._view_refresh_subscriptions()
+                return
+            rel = payload
+            tag = rel.get('tag_name', '')
+            if tag and tag == sub.get('last_tag'):
+                self.log('「{}」已是最新版本 {}，无需更新'.format(sub['repo'], tag), 'ok')
+                self._view_refresh_subscriptions()
+                return
+            assets = source_assets_of(rel)
+            if not assets:
+                self.log('「{}」v{} 没有 .js / .zip 附件，跳过'.format(sub['repo'], tag), 'warn')
+                return
+            try:
+                subdir = self._sub_download_dir(sub)
+                if self.settings.get('keep_history') and sub.get('last_tag'):
+                    self._archive_previous(subdir, sub['last_tag'])
+                scripts = []
+                for a in assets:
+                    scripts.extend(self._asset_to_scripts(a, 'github:{}#{}'.format(sub['repo'], tag), subdir))
+                if not self._auto_backup():
+                    return
+                report = apply_imports(self.entries, scripts, 'update')
+                if not self._save_entries('写入 user_api.json'):
+                    return
+                for s, old_v, new_v in report['updated']:
+                    self.log('更新：{}  v{} → v{}（来自 {}）'.format(s.name, old_v, new_v, sub['repo']), 'update')
+                for s in report['added']:
+                    self.log('新增：{}  v{}（来自 {}）'.format(s.name, s.version, sub['repo']), 'ok')
+                for s, reason in report['skipped']:
+                    self.log('跳过：{}（{}）'.format(s.name, reason), 'warn')
+                for s, err in report['errors']:
+                    self.log('失败：{}：{}'.format(s.name, err), 'error')
+                sub['last_tag'] = tag
+                save_subscriptions(self.subscriptions)
+                self._view_refresh_subscriptions()
+                self._view_refresh_imported()
+                self._view_status()
+                self.log('订阅「{}」处理完成（新增 {} / 更新 {} / 跳过 {}），重启 LX Music 后生效'.format(
+                    sub['repo'], len(report['added']), len(report['updated']), len(report['skipped'])), 'title')
+            except Exception as e:
+                self.log('「{}」下载/解析失败：{}'.format(sub['repo'], e), 'error')
+
+        self._run_task(work, done, '正在更新订阅 {}…'.format(sub['repo']))
+
+    def do_update_all_subscriptions(self):
+        if not self.subscriptions:
+            self._info('提示', '尚未添加任何订阅，请先点「添加订阅」')
+            return
+        subs = list(self.subscriptions)
+        if not self._confirm('一键订阅更新？', '将对 {} 个订阅逐个检查最新 Release，发现新版本自动下载并以「更新模式」导入。'.format(len(subs))):
+            return
+
+        def work():
+            out = []
+            for sub in subs:
+                try:
+                    rel = fetch_latest_release(*sub['repo'].split('/'))
+                    tag = rel.get('tag_name', '')
+                    if tag and tag == sub.get('last_tag'):
+                        out.append((sub, 'skip', tag))
+                        continue
+                    assets = source_assets_of(rel)
+                    if not assets:
+                        out.append((sub, 'noasset', tag))
+                        continue
+                    subdir = self._sub_download_dir(sub)
+                    if self.settings.get('keep_history') and sub.get('last_tag'):
+                        self._archive_previous(subdir, sub['last_tag'])
+                    scripts = []
+                    for a in assets:
+                        scripts.extend(self._asset_to_scripts(a, 'github:{}#{}'.format(sub['repo'], tag), subdir))
+                    out.append((sub, 'new', tag, scripts))
+                except Exception as e:
+                    out.append((sub, 'err', str(e)))
+            return out
+
+        def done(ok, payload):
+            if not ok:
+                self.log('一键订阅更新失败：{}'.format(payload), 'error')
+                return
+            has_new = any(item[1] == 'new' for item in payload)
+            if has_new and not self._auto_backup():
+                return
+            for item in payload:
+                sub, kind = item[0], item[1]
+                if kind == 'skip':
+                    self.log('「{}」已是最新 {}'.format(sub['repo'], item[2]), 'ok')
+                elif kind == 'noasset':
+                    self.log('「{}」v{} 没有 .js / .zip 附件，跳过'.format(sub['repo'], item[2]), 'warn')
+                elif kind == 'err':
+                    self.log('「{}」检查失败：{}'.format(sub['repo'], item[2]), 'error')
+                else:
+                    tag, scripts = item[2], item[3]
+                    self.log('「{}」发现新版本 {}，正在导入…'.format(sub['repo'], tag), 'info')
+                    report = apply_imports(self.entries, scripts, 'update')
+                    for s, old_v, new_v in report['updated']:
+                        self.log('更新：{}  v{} → v{}'.format(s.name, old_v, new_v), 'update')
+                    for s in report['added']:
+                        self.log('新增：{}  v{}'.format(s.name, s.version), 'ok')
+                    for s, reason in report['skipped']:
+                        self.log('跳过：{}（{}）'.format(s.name, reason), 'warn')
+                    for s, err in report['errors']:
+                        self.log('失败：{}：{}'.format(s.name, err), 'error')
+                    sub['last_tag'] = tag
+            if has_new:
+                if not self._save_entries('写入 user_api.json'):
+                    return
+                save_subscriptions(self.subscriptions)
+                self._view_refresh_subscriptions()
+                self._view_refresh_imported()
+                self._view_status()
+                self.log('一键订阅更新完成，重启 LX Music 后生效', 'title')
+            else:
+                self._view_refresh_subscriptions()
+
+        self._run_task(work, done, '正在检查全部订阅…')
+
+    def do_delete_subscriptions(self):
+        checked = sorted(i for i in self.checked_subs if 0 <= i < len(self.subscriptions))
+        if not checked:
+            self._info('提示', '请先在订阅列表中勾选要删除的订阅')
+            return
+        names = '、'.join(str(self.subscriptions[i].get('repo', '?')) for i in checked[:5])
+        if not self._confirm('确认删除订阅？', '将删除 {} 个订阅：\n{}{}'.format(len(checked), names, ' …' if len(checked) > 5 else '')):
+            return
+        for i in reversed(checked):
+            self.subscriptions.pop(i)
+        self.checked_subs = set()
+        save_subscriptions(self.subscriptions)
+        self._view_refresh_subscriptions()
+        self.log('已删除 {} 个订阅'.format(len(checked)), 'ok')
+
+    def do_set_mirror(self, value):
+        value = (value or '').strip()
+        if value == '直连' or value.startswith('例如 '):
+            value = ''
+        if value == self.settings['mirror']:
+            set_mirror(value)
+            return
+        self.settings['mirror'] = value
+        set_mirror(value)
+        save_settings(self.settings)
+        self.log('镜像已切换：{}'.format(value or '直连（官方 GitHub）'), 'ok')
+
+    def do_toggle_idm(self, want):
+        if want and not self.idm_path:
+            self._info('提示', '未检测到 IDM（Internet Download Manager），继续使用内置下载')
+            self.idm_var.set(False)
+            return
+        self.settings['use_idm'] = self.use_idm = bool(want)
+        save_settings(self.settings)
+        self._view_refresh_settings_row()
+        self.log('订阅下载已切换为：{}'.format('IDM 下载' if self.use_idm else '内置下载'), 'ok')
+
+    def _setup_placeholder(self, entry, text):
+        """给输入框加灰色占位提示（例如 https://ghfast.top），兼容 tk/ttk 输入框。"""
+
+        def set_color(color):
+            try:
+                entry.configure(fg=color)
+            except Exception:
+                try:
+                    entry.configure(foreground=color)
+                except Exception:
+                    pass
+
+        ph = PALETTE['faint']
+        if not entry.get():
+            entry.insert(0, text)
+            set_color(ph)
+        else:
+            set_color(PALETTE['text'])
+
+        def on_in(_e):
+            if entry.get() == text:
+                entry.delete(0, 'end')
+                set_color(PALETTE['text'])
+
+        def on_out(_e):
+            if not entry.get():
+                entry.insert(0, text)
+                set_color(ph)
+
+        entry.bind('<FocusIn>', on_in, add='+')
+        entry.bind('<FocusOut>', on_out, add='+')
+
+    def _on_mirror_preset(self, choice):
+        value = '' if choice == '直连' else choice
+        self.mirror_entry.delete(0, 'end')
+        self.mirror_entry.insert(0, value)
+        self.mirror_entry.configure(fg=PALETTE['text'])
+        self.do_set_mirror(value)
+
+    def _sub_download_dir(self, sub):
+        return os.path.join(effective_download_dir(self.settings), sub['repo'])
+
+    def _archive_previous(self, subdir, tag):
+        """开启「保存历史订阅」时，把当前下载目录归档到 history/<tag>。"""
+        if not os.path.isdir(subdir):
+            return
+        items = [n for n in os.listdir(subdir) if n != 'history']
+        if not items:
+            return
+        try:
+            hist = os.path.join(subdir, 'history', tag)
+            os.makedirs(hist, exist_ok=True)
+            for it in items:
+                s = os.path.join(subdir, it)
+                d = os.path.join(hist, it)
+                if os.path.isdir(s):
+                    shutil.copytree(s, d, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(s, d)
+        except Exception:
+            pass
+
+    def _download_asset_file(self, asset, subdir):
+        """把附件下载到订阅目录并返回本地路径（优先 IDM，未装/失败则内置下载）。"""
+        name = asset.get('name', 'asset')
+        os.makedirs(subdir, exist_ok=True)
+        target = os.path.join(subdir, os.path.basename(name))
+        if os.path.exists(target):
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+        if self.use_idm and self.idm_path:
+            url = mirrored_url(asset['browser_download_url'])
+            subprocess.Popen([self.idm_path, '/d', url, '/p', subdir, '/f', os.path.basename(name), '/n', '/s'])
+            deadline = time.time() + 600
+            while time.time() < deadline:
+                if os.path.isfile(target) and os.path.getsize(target) > 0:
+                    break
+                time.sleep(2)
+            else:
+                raise ValueError('等待 IDM 下载超时（10 分钟）：{}'.format(name))
+        else:
+            data = download_bytes(asset['browser_download_url'])
+            with open(target, 'wb') as f:
+                f.write(data)
+        return target
+
+    def _asset_to_scripts(self, asset, src_label, subdir):
+        """下载附件（内置或 IDM）→ 保存/解压到订阅目录 → 解析全部脚本。"""
+        name = asset.get('name', 'asset')
+        target = self._download_asset_file(asset, subdir)
+        if name.lower().endswith('.zip'):
+            try:
+                _safe_extract_zip(target, subdir)
+            except Exception as e:
+                raise ValueError('解压失败：{}'.format(e))
+            items = []
+            for root2, _dirs, files2 in os.walk(subdir):
+                for fn in files2:
+                    if fn.lower().endswith('.js'):
+                        items.append(os.path.join(root2, fn))
+        else:
+            items = [target]
+        scripts = []
+        for p in items:
+            with open(p, 'rb') as f:
+                content = f.read()
+            text, enc = decode_script_bytes(content)
+            meta = parse_script_meta(text, fallback_name=os.path.splitext(os.path.basename(p))[0])
+            scripts.append(SourceScript(p, os.path.relpath(p, subdir), text, meta, enc,
+                                        _BLOCK_RE.match(text) is None))
+        return scripts
+
+    def do_show_subscription_sources(self, sub):
+        """单击订阅：把该订阅已下载的音源刷新进「待导入音源」列表。"""
+        self._current_sub = sub.get('repo')
+        self._view_refresh_subscriptions()
+        d = self._sub_download_dir(sub)
+        if not os.path.isdir(d):
+            self._info('提示', '该订阅还没有本地下载\n\n请先点「一键更新」或双击该订阅下载音源。')
+            return
+        base = os.path.normcase(os.path.abspath(d)) + os.sep
+        keep = [s for s in self.candidates
+                if not os.path.normcase(os.path.abspath(s.path)).startswith(base)]
+        removed = len(self.candidates) - len(keep)
+        self.candidates = keep
+        self.checked_candidates = set()
+        existing = {os.path.normcase(os.path.abspath(s.path)) for s in self.candidates}
+        added = 0
+        for s in scan_source_folder(d):
+            key = os.path.normcase(os.path.abspath(s.path))
+            if key in existing:
+                continue
+            self.candidates.append(s)
+            existing.add(key)
+            added += 1
+        self._view_refresh_candidates()
+        self.log('订阅「{}」：刷新本地音源（移除 {} 个旧条目，加载 {} 个）'.format(sub['repo'], removed, added),
+                 'ok' if added else 'warn')
+
+    def do_open_download_dir(self, sub=None):
+        d = self._sub_download_dir(sub) if sub else effective_download_dir(self.settings)
+        self._open_dir(d)
+
+    def do_delete_subscription(self, sub):
+        if not self._confirm('确认删除订阅？', '将删除订阅「{}」。\n\n已下载的音源文件不会被删除。'.format(sub.get('repo'))):
+            return
+        self.subscriptions = [s for s in self.subscriptions if s.get('repo') != sub.get('repo')]
+        if self._current_sub == sub.get('repo'):
+            self._current_sub = None
+        save_subscriptions(self.subscriptions)
+        self._view_refresh_subscriptions()
+        self.log('已删除订阅「{}」'.format(sub.get('repo')), 'ok')
+
+    # ---------------- 配置 ----------------
+    def apply_settings(self):
+        """配置变更后刷新主界面（备份卡片/日志窗口显隐等）。"""
+        try:
+            self.backup_dir = effective_backup_dir(self.settings)
+            self.backups = BackupManager(self.backup_dir)
+            self._view_apply_backup_visible()
+            self._view_apply_log_visible()
+            self._view_refresh_settings_row()
+            self._view_status()
+        except Exception as e:
+            self.log('应用配置失败：{}'.format(e), 'error')
+
+    def do_set_backup_enabled(self, enable):
+        self.settings['backup_enabled'] = bool(enable)
+        save_settings(self.settings)
+        self.log('自动备份已{}'.format('开启' if enable else '关闭'), 'ok')
+        self.apply_settings()
+
+    def do_set_backup_dir(self, path):
+        path = (path or '').strip()
+        if path and not os.path.isdir(path):
+            self._info('提示', '目录不存在，请重新选择')
+            return
+        old = effective_backup_dir(self.settings)
+        if path == old:
+            return
+        if old and os.path.isdir(old):
+            files = [f for f in os.listdir(old) if f.lower().endswith('.json')]
+            if files:
+                if not self._confirm('迁移旧备份？', '检测到旧备份目录中还有 {} 个备份文件。\n\n是否将旧备份迁移到新目录？'.format(len(files))):
+                    return
+                try:
+                    os.makedirs(path, exist_ok=True)
+                    moved = 0
+                    for fn in files:
+                        s = os.path.join(old, fn)
+                        if os.path.isfile(s):
+                            shutil.copy2(s, os.path.join(path, fn))
+                            moved += 1
+                    self.log('已迁移 {} 个备份文件到：{}'.format(moved, path), 'ok')
+                except Exception as e:
+                    self.log('迁移失败：{}'.format(e), 'error')
+                    return
+        self.settings['backup_dir'] = path
+        save_settings(self.settings)
+        self.log('备份文件夹已改为：{}'.format(path or '（默认 config/backups）'), 'ok')
+        self.apply_settings()
+
+    def do_set_download_dir(self, path):
+        path = (path or '').strip()
+        if path and not os.path.isdir(path):
+            self._info('提示', '目录不存在，请重新选择')
+            return
+        self.settings['download_dir'] = path
+        save_settings(self.settings)
+        self.log('订阅下载目录已改为：{}'.format(path or '（默认下载目录/lxsubscribe）'), 'ok')
+
+    def do_set_keep_history(self, enable):
+        self.settings['keep_history'] = bool(enable)
+        save_settings(self.settings)
+        self.log('历史订阅保存已{}'.format('开启（更新前归档旧版本到 history 子目录）' if enable else '关闭'), 'ok')
+
+    def do_set_log_enabled(self, enable):
+        self.settings['log_enabled'] = bool(enable)
+        if not enable:
+            self.settings['log_window'] = False
+        save_settings(self.settings)
+        self.log('日志记录已{}'.format('开启' if enable else '关闭'), 'ok')
+        self.apply_settings()
+
+    def do_set_log_window(self, enable):
+        if enable and not self.settings.get('log_enabled', True):
+            self._info('提示', '请先开启「记录日志」才能显示日志窗口')
+            return
+        self.settings['log_window'] = bool(enable)
+        save_settings(self.settings)
+        self.apply_settings()
+
+    def do_open_settings(self):
+        raise NotImplementedError
+
     # ---------------- 其他 ----------------
     def do_relocate(self):
         p = self._view_ask_file()
@@ -772,6 +1635,21 @@ class BaseApp:
         raise NotImplementedError
 
     def _view_refresh_backups(self):
+        raise NotImplementedError
+
+    def _view_refresh_subscriptions(self):
+        raise NotImplementedError
+
+    def _view_apply_backup_visible(self):
+        raise NotImplementedError
+
+    def _view_apply_log_visible(self):
+        raise NotImplementedError
+
+    def _view_refresh_settings_row(self):
+        pass
+
+    def _view_input(self, title, prompt):
         raise NotImplementedError
 
     def _view_confirm(self, title, message, danger=False):
@@ -881,8 +1759,22 @@ class CtkApp(BaseApp):
         import customtkinter as ctk
         self.ctk = ctk
         self.C = PALETTE
+        # 禁用 CTk 自动 DPI 缩放：固定 1:1 渲染，避免高 DPI 屏上窗口超出屏幕、布局被撑破
+        try:
+            ctk.deactivate_automatic_dpi_awareness()
+        except Exception:
+            pass
+        try:
+            ctk.set_widget_scaling(1.0)
+            ctk.set_window_scaling(1.0)
+        except Exception:
+            pass
         self.animations = not hidden
         self.SmoothFrame = smooth_scrollable_class()
+        self.settings = load_settings()
+        set_mirror(self.settings['mirror'])
+        self.use_idm = self.settings['use_idm']
+        self.idm_path = find_idm_path()
         ctk.set_appearance_mode('light')
         ctk.set_default_color_theme('blue')
         self.root = ctk.CTk(fg_color=self.C['bg'])
@@ -923,14 +1815,14 @@ class CtkApp(BaseApp):
 
     def _build(self):
         ctk, C = self.ctk, self.C
-        self.f_title = ctk.CTkFont(family=FONT_FAMILY, size=18, weight='bold')
-        self.f_card = ctk.CTkFont(family=FONT_FAMILY, size=14, weight='bold')
-        self.f_base = ctk.CTkFont(family=FONT_FAMILY, size=13)
-        self.f_bold = ctk.CTkFont(family=FONT_FAMILY, size=13, weight='bold')
-        self.f_small = ctk.CTkFont(family=FONT_FAMILY, size=12)
-        self.f_tiny = ctk.CTkFont(family=FONT_FAMILY, size=11)
-        self.f_btn = ctk.CTkFont(family=FONT_FAMILY, size=13)
-        self.f_log = ctk.CTkFont(family=FONT_FAMILY, size=12)
+        self.f_title = ctk.CTkFont(family=FONT_FAMILY, size=19, weight='bold')
+        self.f_card = ctk.CTkFont(family=FONT_FAMILY, size=15, weight='bold')
+        self.f_base = ctk.CTkFont(family=FONT_FAMILY, size=14)
+        self.f_bold = ctk.CTkFont(family=FONT_FAMILY, size=14, weight='bold')
+        self.f_small = ctk.CTkFont(family=FONT_FAMILY, size=13)
+        self.f_tiny = ctk.CTkFont(family=FONT_FAMILY, size=12)
+        self.f_btn = ctk.CTkFont(family=FONT_FAMILY, size=14)
+        self.f_log = ctk.CTkFont(family=FONT_FAMILY, size=13)
 
         self.root.grid_rowconfigure(1, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
@@ -948,6 +1840,7 @@ class CtkApp(BaseApp):
         self.path_label.grid(row=0, column=2, rowspan=2, sticky='e', padx=(8, 12))
         btns = ctk.CTkFrame(header, fg_color='transparent')
         btns.grid(row=0, column=3, rowspan=2, sticky='e', padx=(0, 14), pady=10)
+        self._btn(btns, '⚙', self.do_open_settings, width=36).pack(side='left', padx=(0, 8))
         self._btn(btns, '重新定位', self.do_relocate, width=84).pack(side='left', padx=(0, 8))
         self._btn(btns, '打开数据目录', self.do_open_data_dir, width=100).pack(side='left')
 
@@ -969,6 +1862,7 @@ class CtkApp(BaseApp):
         bottom.grid(row=2, column=0, sticky='ew', padx=14, pady=(6, 4))
         bottom.grid_columnconfigure(0, weight=2, uniform='bot')
         bottom.grid_columnconfigure(1, weight=3, uniform='bot')
+        bottom.grid_columnconfigure(2, weight=3, uniform='bot')
         self._build_bottom(bottom)
 
         # ---------- 状态栏 ----------
@@ -1008,9 +1902,13 @@ class CtkApp(BaseApp):
                      text_color=C['text'], placeholder_text_color=C['faint'], font=self.f_small).grid(
             row=2, column=0, sticky='ew', padx=14, pady=(2, 4))
 
-        self.cand_list = self.SmoothFrame(card, fg_color=C['card'], corner_radius=0,
+        # 隔离容器：CTk 滚动条默认请求高度 200px，会撑破布局，用固定容器隔绝其影响
+        _cand_holder = tk.Frame(card, bg=C['card'])
+        _cand_holder.grid_propagate(False)
+        _cand_holder.grid(row=3, column=0, sticky='nsew', padx=10, pady=2)
+        self.cand_list = self.SmoothFrame(_cand_holder, fg_color=C['card'], corner_radius=0,
                                           scrollbar_button_color=C['border'], scrollbar_button_hover_color=C['faint'])
-        self.cand_list.grid(row=3, column=0, sticky='nsew', padx=10, pady=2)
+        self.cand_list.pack(fill='both', expand=True)
         self.cand_rows = {}
 
         seg_row = ctk.CTkFrame(card, fg_color='transparent')
@@ -1021,8 +1919,8 @@ class CtkApp(BaseApp):
             seg_row, values=[MODE_ADD_LABEL, MODE_UPDATE_LABEL], variable=self.mode_var,
             command=lambda v: self._set_mode(v), height=30, corner_radius=6,
             selected_color=C['accent'], selected_hover_color=C['accent_hover'],
-            unselected_color=C['field'], unselected_hover_color=C['hover'],
-            text_color=C['text'], font=self.f_small)
+            unselected_color=C['card'], unselected_hover_color=C['hover'],
+            fg_color=C['card'], text_color=C['text'], font=self.f_small)
         self.mode_seg.pack(side='left')
 
         act = ctk.CTkFrame(card, fg_color='transparent')
@@ -1059,9 +1957,12 @@ class CtkApp(BaseApp):
         ctk.CTkLabel(cols, text='作者', font=self.f_tiny, text_color=C['faint']).grid(row=0, column=2, sticky='w', padx=(0, 8))
         ctk.CTkLabel(cols, text='描述', font=self.f_tiny, text_color=C['faint']).grid(row=0, column=3, sticky='w')
 
-        self.imp_list = self.SmoothFrame(card, fg_color=C['card'], corner_radius=0,
+        _imp_holder = tk.Frame(card, bg=C['card'])
+        _imp_holder.grid_propagate(False)
+        _imp_holder.grid(row=2, column=0, sticky='nsew', padx=10, pady=2)
+        self.imp_list = self.SmoothFrame(_imp_holder, fg_color=C['card'], corner_radius=0,
                                          scrollbar_button_color=C['border'], scrollbar_button_hover_color=C['faint'])
-        self.imp_list.grid(row=2, column=0, sticky='nsew', padx=10, pady=2)
+        self.imp_list.pack(fill='both', expand=True)
         self.imp_rows = {}
 
         act = ctk.CTkFrame(card, fg_color='transparent')
@@ -1079,6 +1980,7 @@ class CtkApp(BaseApp):
 
         bk = ctk.CTkFrame(bottom, fg_color=C['card'], corner_radius=8)
         bk.grid(row=0, column=0, sticky='nsew', padx=(0, 6))
+        self._bk_card = bk
         bk.grid_columnconfigure(0, weight=1)
         head = ctk.CTkFrame(bk, fg_color='transparent')
         head.grid(row=0, column=0, sticky='ew', padx=14, pady=(12, 2))
@@ -1091,23 +1993,74 @@ class CtkApp(BaseApp):
         self._btn(btns, '打开文件夹', self.do_open_backup_dir, width=78).pack(side='left', padx=2)
         self._btn(btns, '删除所选', self.do_delete_backups, width=68).pack(side='left', padx=2)
         self._btn(btns, '清空备份', self.do_clear_backups, width=68).pack(side='left', padx=2)
-        self.bk_list = self.SmoothFrame(bk, fg_color=C['card'], corner_radius=0, height=112,
+        _bk_holder = tk.Frame(bk, bg=C['card'], height=112)
+        _bk_holder.pack_propagate(False)
+        _bk_holder.grid(row=1, column=0, sticky='ew', padx=10, pady=(2, 10))
+        self.bk_list = self.SmoothFrame(_bk_holder, fg_color=C['card'], corner_radius=0,
                                         scrollbar_button_color=C['border'], scrollbar_button_hover_color=C['faint'])
-        self.bk_list.grid(row=1, column=0, sticky='ew', padx=10, pady=(2, 10))
+        self.bk_list.pack(fill='both', expand=True)
         self.bk_rows = {}
 
+        sub = ctk.CTkFrame(bottom, fg_color=C['card'], corner_radius=8)
+        sub.grid(row=0, column=1, sticky='nsew', padx=(6, 6))
+        self._sub_card = sub
+        sub.grid_columnconfigure(0, weight=1)
+        head = ctk.CTkFrame(sub, fg_color='transparent')
+        head.grid(row=0, column=0, sticky='ew', padx=14, pady=(12, 2))
+        head.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(head, text='订阅更新', font=self.f_card, text_color=C['text']).grid(row=0, column=0, sticky='w')
+        btns = ctk.CTkFrame(head, fg_color='transparent')
+        btns.grid(row=0, column=1, sticky='e')
+        self._btn(btns, '添加订阅', self.do_add_subscription, kind='primary', width=66).pack(side='left', padx=2)
+        self._btn(btns, '检查更新', self.do_check_subscriptions, width=66).pack(side='left', padx=2)
+        self._btn(btns, '一键更新', self.do_update_all_subscriptions, width=66).pack(side='left', padx=2)
+        self._btn(btns, '打开目录', self.do_open_download_dir, width=66).pack(side='left', padx=2)
+        _sub_holder = tk.Frame(sub, bg=C['card'], height=112)
+        _sub_holder.pack_propagate(False)
+        _sub_holder.grid(row=1, column=0, sticky='ew', padx=10, pady=(2, 10))
+        self.sub_list = self.SmoothFrame(_sub_holder, fg_color=C['card'], corner_radius=0,
+                                         scrollbar_button_color=C['border'], scrollbar_button_hover_color=C['faint'])
+        self.sub_list.pack(fill='both', expand=True)
+        self.sub_rows = {}
+
+        setrow = tk.Frame(sub, bg=C['card'])
+        setrow.grid(row=2, column=0, sticky='ew', padx=14, pady=(0, 8))
+        tk.Label(setrow, text='镜像', bg=C['card'], fg=C['muted'], font=self.f_tiny).pack(side='left')
+        self.mirror_entry = tk.Entry(setrow, bg=C['field'], fg=C['text'],
+                                     insertbackground=C['text'], relief='flat', highlightthickness=1,
+                                     highlightbackground=C['border'], highlightcolor=C['accent'],
+                                     font=self.f_tiny, width=17)
+        self.mirror_entry.pack(side='left', padx=6)
+        self.mirror_entry.insert(0, self.settings['mirror'])
+        self._setup_placeholder(self.mirror_entry, '例如 https://ghfast.top')
+        self.mirror_entry.bind('<Return>', lambda e: self.do_set_mirror(self.mirror_entry.get()))
+        self.mirror_entry.bind('<FocusOut>', lambda e: self.do_set_mirror(self.mirror_entry.get()))
+        self.mirror_combo = ctk.CTkOptionMenu(
+            setrow, values=['直连', 'gh-proxy.com', 'ghfast.top', 'ghproxy.net', 'gh.api.99988866.xyz'],
+            command=self._on_mirror_preset, height=28, corner_radius=6,
+            fg_color=C['field'], button_color=C['accent'], button_hover_color=C['accent_hover'],
+            text_color=C['text'], dropdown_fg_color=C['card'], dropdown_hover_color=C['hover'],
+            dropdown_text_color=C['text'], font=self.f_tiny)
+        self.mirror_combo.pack(side='left', padx=6)
+        self.idm_var = tk.BooleanVar(value=bool(self.use_idm and self.idm_path))
+        WebCheck(setrow, variable=self.idm_var, command=lambda: self.do_toggle_idm(self.idm_var.get())).pack(side='left', padx=(10, 4), pady=5)
+        tk.Label(setrow, text='IDM 下载', bg=C['card'], fg=C['muted'], font=self.f_tiny).pack(side='left')
+
         lg = ctk.CTkFrame(bottom, fg_color=C['card'], corner_radius=8)
-        lg.grid(row=0, column=1, sticky='nsew', padx=(6, 0))
+        lg.grid(row=0, column=2, sticky='nsew', padx=(6, 0))
+        self._lg_card = lg
         lg.grid_columnconfigure(0, weight=1)
-        lg.grid_rowconfigure(1, weight=1)
         head = ctk.CTkFrame(lg, fg_color='transparent')
         head.grid(row=0, column=0, sticky='ew', padx=14, pady=(12, 2))
         head.grid_columnconfigure(1, weight=1)
         ctk.CTkLabel(head, text='运行日志', font=self.f_card, text_color=C['text']).grid(row=0, column=0, sticky='w')
         self._btn(head, '清空日志', self.do_clear_log, width=80).grid(row=0, column=1, sticky='e')
-        self.logbox = ctk.CTkTextbox(lg, fg_color=C['field'], corner_radius=6, font=self.f_log,
-                                     wrap='word', height=112, state='disabled')
-        self.logbox.grid(row=1, column=0, sticky='nsew', padx=10, pady=(2, 10))
+        _lg_holder = tk.Frame(lg, bg=C['field'], height=112)
+        _lg_holder.pack_propagate(False)
+        _lg_holder.grid(row=1, column=0, sticky='ew', padx=10, pady=(2, 10))
+        self.logbox = ctk.CTkTextbox(_lg_holder, fg_color=C['field'], corner_radius=6, font=self.f_log,
+                                     wrap='word', state='disabled')
+        self.logbox.pack(fill='both', expand=True)
         for tag, color in LOG_COLORS.items():
             self.logbox.tag_config(tag, foreground=color)
 
@@ -1318,6 +2271,265 @@ class CtkApp(BaseApp):
             for w in (row, name_l, meta_l):
                 w.bind('<Button-1>', lambda e, n=f['name'], frm=row: self._bk_toggle(n, frm))
 
+    # ---------------- 订阅行 ----------------
+    def _build_sub_row(self, i, sub):
+        C = self.C
+        is_current = sub.get('repo') == self._current_sub
+        row_bg = C['card2'] if is_current else C['card']
+        row = tk.Frame(self.sub_list, bg=row_bg, cursor='hand2')
+        row.pack(fill='x', padx=4, pady=2)
+        name_l = tk.Label(row, text=short(sub.get('repo', ''), 24), bg=row_bg, fg=C['text'],
+                          font=self.f_small, anchor='w', cursor='hand2')
+        name_l.pack(side='left', padx=(14, 6), pady=5)
+        tag = sub.get('last_tag')
+        st_l = tk.Label(row, text=('已用 ' + tag) if tag else '未导入', bg=row_bg,
+                        fg=C['green'] if tag else C['faint'], font=self.f_tiny, cursor='hand2')
+        st_l.pack(side='right', padx=10, pady=5)
+        self.sub_rows[i] = row
+        for w in (row, name_l, st_l):
+            w.bind('<Button-1>', lambda e, s=sub: self.do_show_subscription_sources(s))
+            w.bind('<Double-Button-1>', lambda e, s=sub: self.do_update_subscription(s))
+            w.bind('<Enter>', lambda e, frm=row, cur=is_current: self._sub_enter(frm, cur))
+            w.bind('<Leave>', lambda e, frm=row, cur=is_current: self._sub_leave(frm, cur))
+
+    def _sub_enter(self, row, is_current):
+        if not is_current:
+            self._set_row_color(row, self.C['hover'])
+
+    def _sub_leave(self, row, is_current):
+        self._set_row_color(row, self.C['card2'] if is_current else self.C['card'])
+
+    def _view_refresh_subscriptions(self):
+        for w in self.sub_list.winfo_children():
+            w.destroy()
+        self.sub_rows = {}
+        if not self.subscriptions:
+            tk.Label(self.sub_list,
+                     text='暂无订阅\n点「添加订阅」填入 GitHub 仓库（owner/repo）\n单击订阅可把其本地音源加载到「待导入音源」\n双击订阅立即下载并更新',
+                     bg=self.C['card'], fg=self.C['faint'], font=self.f_small, justify='center').pack(pady=14)
+            return
+        for i, sub in enumerate(self.subscriptions):
+            self._build_sub_row(i, sub)
+
+    def _view_input(self, title, prompt):
+        ctk, C = self.ctk, self.C
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title(title)
+        dlg.configure(fg_color=C['card'])
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.grab_set()
+        ctk.CTkLabel(dlg, text=prompt, wraplength=400, justify='left', font=self.f_base,
+                     text_color=C['text']).pack(padx=22, pady=(18, 10), anchor='w')
+        entry = ctk.CTkEntry(dlg, width=380, height=32, corner_radius=6, fg_color=C['field'],
+                             border_color=C['border'], text_color=C['text'], font=self.f_small)
+        entry.pack(padx=22, pady=(0, 12))
+        btns = ctk.CTkFrame(dlg, fg_color='transparent')
+        btns.pack(pady=(0, 16))
+        result = {'val': None}
+
+        def ok():
+            result['val'] = entry.get().strip()
+            dlg.destroy()
+
+        entry.bind('<Return>', lambda e: ok())
+        ctk.CTkButton(btns, text='取消', width=96, height=32, corner_radius=6, font=self.f_btn,
+                      fg_color='transparent', border_width=1, border_color=C['border'],
+                      text_color=C['muted'], hover_color=C['hover'], command=dlg.destroy).pack(side='left', padx=6)
+        ctk.CTkButton(btns, text='确定', width=96, height=32, corner_radius=6, font=self.f_btn,
+                      fg_color=C['accent'], hover_color=C['accent_hover'], text_color='#fffaf5', command=ok).pack(side='left', padx=6)
+        try:
+            dlg.update_idletasks()
+            w = max(460, dlg.winfo_reqwidth() + 40)
+            h = dlg.winfo_reqheight() + 16
+            x = self.root.winfo_rootx() + max((self.root.winfo_width() - w) // 2, 0)
+            y = self.root.winfo_rooty() + max((self.root.winfo_height() - h) // 2, 0)
+            dlg.geometry('{}x{}+{}+{}'.format(w, h, x, y))
+        except Exception:
+            pass
+        dlg.after(60, entry.focus_set)
+        dlg.wait_window()
+        return result['val']
+
+    # ---------------- 配置窗口 ----------------
+    def _view_apply_backup_visible(self):
+        try:
+            if self.settings.get('backup_enabled', True):
+                self._bk_card.grid()
+            else:
+                self._bk_card.grid_remove()
+        except Exception:
+            pass
+
+    def _view_apply_log_visible(self):
+        try:
+            show = self.settings.get('log_enabled', True) and self.settings.get('log_window', True)
+            if show:
+                self._lg_card.grid()
+            else:
+                self._lg_card.grid_remove()
+        except Exception:
+            pass
+
+    def _view_refresh_settings_row(self):
+        try:
+            self.idm_var.set(bool(self.use_idm and self.idm_path))
+        except Exception:
+            pass
+
+    def _pick_dir_to(self, entry, cb):
+        d = filedialog.askdirectory(parent=self.root, title='选择文件夹',
+                                    initialdir=entry.get() or self.last_folder)
+        if d:
+            entry.delete(0, 'end')
+            entry.insert(0, d)
+            cb(d)
+
+    def _on_settings_close(self):
+        try:
+            self._settings_win.destroy()
+        except Exception:
+            pass
+        self._settings_win = None
+
+    def _open_cfg_sub_dir(self):
+        sel = self.cfg_sublist.curselection()
+        if not sel:
+            self._info('提示', '请先选择要打开的订阅')
+            return
+        sub = next((s for s in self.subscriptions if s.get('repo') == self.cfg_sublist.get(sel[0])), None)
+        if sub:
+            self.do_open_download_dir(sub)
+
+    def _delete_cfg_sub(self):
+        sel = self.cfg_sublist.curselection()
+        if not sel:
+            self._info('提示', '请先选择要删除的订阅')
+            return
+        sub = next((s for s in self.subscriptions if s.get('repo') == self.cfg_sublist.get(sel[0])), None)
+        if sub:
+            self.do_delete_subscription(sub)
+            try:
+                self.cfg_sublist.delete(sel[0])
+            except Exception:
+                pass
+
+    def do_open_settings(self):
+        ctk, C = self.ctk, self.C
+        if self._settings_win is not None:
+            try:
+                if self._settings_win.winfo_exists():
+                    self._settings_win.lift()
+                    return
+            except Exception:
+                pass
+        win = ctk.CTkToplevel(self.root)
+        self._settings_win = win
+        win.title('设置')
+        win.configure(fg_color=C['bg'])
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.protocol('WM_DELETE_WINDOW', self._on_settings_close)
+        win.grid_columnconfigure(0, weight=1)
+
+        def sec(title, row):
+            f = ctk.CTkFrame(win, fg_color=C['card'], corner_radius=8)
+            f.grid(row=row, column=0, sticky='ew', padx=16, pady=(10, 0))
+            f.grid_columnconfigure(1, weight=1)
+            ctk.CTkLabel(f, text=title, font=self.f_card, text_color=C['text']).grid(
+                row=0, column=0, columnspan=3, sticky='w', padx=14, pady=(10, 4))
+            return f
+
+        def wlab(f, r, text, col=0, span=1):
+            ctk.CTkLabel(f, text=text, font=self.f_small, text_color=C['text'], anchor='w').grid(
+                row=r, column=col, columnspan=span, sticky='w', padx=(14, 8), pady=4)
+
+        def wsub(f, r, text):
+            ctk.CTkLabel(f, text=text, font=self.f_tiny, text_color=C['faint'], anchor='w').grid(
+                row=r, column=1, columnspan=2, sticky='w', padx=14, pady=(0, 4))
+
+        def wentry(f, r, value, on_change, width=30):
+            e = tk.Entry(f, bg=C['field'], fg=C['text'], insertbackground=C['text'],
+                         relief='flat', highlightthickness=1, highlightbackground=C['border'],
+                         highlightcolor=C['accent'], font=self.f_small, width=width)
+            e.grid(row=r, column=1, sticky='ew', padx=(0, 8), pady=4)
+            e.insert(0, value)
+            e.bind('<Return>', lambda ev: on_change(e.get()))
+            e.bind('<FocusOut>', lambda ev: on_change(e.get()))
+            return e
+
+        def wcheck(f, r, var, label, on_toggle):
+            WebCheck(f, variable=var, command=on_toggle).grid(row=r, column=0, padx=(14, 4), pady=4)
+            wlab(f, r, label, 1)
+
+        # ---- 一、备份配置 ----
+        f1 = sec('一、备份配置', 0)
+        self.cfg_backup_var = tk.BooleanVar(value=self.settings.get('backup_enabled', True))
+        wcheck(f1, 1, self.cfg_backup_var, '自动备份（每次写操作前备份；关闭后隐藏备份模块）',
+               lambda: self.do_set_backup_enabled(self.cfg_backup_var.get()))
+        wlab(f1, 2, '备份文件夹', 0)
+        self.cfg_backup_entry = wentry(f1, 2, effective_backup_dir(self.settings),
+                                       self.do_set_backup_dir)
+        self._btn(f1, '浏览…', lambda: self._pick_dir_to(self.cfg_backup_entry, self.do_set_backup_dir),
+                  width=64).grid(row=2, column=2, padx=(0, 14), pady=4)
+        wsub(f1, 3, '更改目录时可将旧备份迁移到新位置')
+
+        # ---- 二、订阅配置 ----
+        f2 = sec('二、订阅配置', 1)
+        wlab(f2, 1, '下载目录', 0)
+        self.cfg_dl_entry = wentry(f2, 1, effective_download_dir(self.settings),
+                                   self.do_set_download_dir)
+        self._btn(f2, '浏览…', lambda: self._pick_dir_to(self.cfg_dl_entry, self.do_set_download_dir),
+                  width=64).grid(row=1, column=2, padx=(0, 14), pady=4)
+        wsub(f2, 2, '每个订阅存放于 下载目录/<仓库名>/ 子文件夹；zip 附件自动解压')
+        self.cfg_idm_var = tk.BooleanVar(value=bool(self.use_idm and self.idm_path))
+        wcheck(f2, 3, self.cfg_idm_var, '使用 IDM 下载（检测到 IDM 时可用）',
+               lambda: self.do_toggle_idm(self.cfg_idm_var.get()))
+        self.cfg_hist_var = tk.BooleanVar(value=self.settings.get('keep_history', False))
+        wcheck(f2, 4, self.cfg_hist_var, '保存历史订阅（更新前归档旧版本到 history 子目录，默认关闭）',
+               lambda: self.do_set_keep_history(self.cfg_hist_var.get()))
+        wlab(f2, 5, '已有订阅', 0)
+        self.cfg_sublist = tk.Listbox(f2, height=3, bg=C['field'], fg=C['text'], relief='flat',
+                                      highlightthickness=1, highlightbackground=C['border'],
+                                      font=self.f_small, selectbackground=C['card2'],
+                                      selectforeground=C['text'])
+        self.cfg_sublist.grid(row=5, column=1, columnspan=2, sticky='ew', padx=(0, 14), pady=4)
+        for s in self.subscriptions:
+            self.cfg_sublist.insert('end', s.get('repo', ''))
+        self._btn(f2, '打开文件夹', self._open_cfg_sub_dir, width=84).grid(
+            row=6, column=1, sticky='w', padx=(0, 8), pady=(0, 10))
+        self._btn(f2, '删除订阅', self._delete_cfg_sub, width=84).grid(
+            row=6, column=2, sticky='w', padx=(0, 14), pady=(0, 10))
+
+        # ---- 三、日志配置 ----
+        f3 = sec('三、日志配置', 2)
+        self.cfg_log_var = tk.BooleanVar(value=self.settings.get('log_enabled', True))
+        wcheck(f3, 1, self.cfg_log_var, '记录日志（写入 config/logs/app.log）',
+               lambda: self.do_set_log_enabled(self.cfg_log_var.get()))
+        self.cfg_logwin_var = tk.BooleanVar(
+            value=self.settings.get('log_enabled', True) and self.settings.get('log_window', True))
+        wcheck(f3, 2, self.cfg_logwin_var, '显示日志窗口（需先开启记录日志）',
+               lambda: self.do_set_log_window(self.cfg_logwin_var.get()))
+
+        bottom_row = ctk.CTkFrame(win, fg_color='transparent')
+        bottom_row.grid(row=3, column=0, sticky='e', padx=16, pady=12)
+        self._btn(bottom_row, '关闭', self._on_settings_close, width=88).pack(side='left')
+        try:
+            win.update_idletasks()
+            w = max(620, win.winfo_reqwidth() + 30)
+            h = win.winfo_reqheight() + 12
+            x = self.root.winfo_rootx() + max((self.root.winfo_width() - w) // 2, 0)
+            y = self.root.winfo_rooty() + max((self.root.winfo_height() - h) // 2, 0)
+            win.geometry('{}x{}+{}+{}'.format(w, h, x, y))
+        except Exception:
+            pass
+        if self.animations:
+            try:
+                win.attributes('-alpha', 0.0)
+            except Exception:
+                pass
+            self._fade_in(win, steps=6, interval=18)
+
     def _view_log(self, text, level='info'):
         try:
             self.logbox.configure(state='normal')
@@ -1441,6 +2653,10 @@ class TtkApp(BaseApp):
     def __init__(self, user_api_path=None, backup_dir=None, auto_confirm=False, hidden=False):
         self.C = PALETTE
         self.animations = not hidden
+        self.settings = load_settings()
+        set_mirror(self.settings['mirror'])
+        self.use_idm = self.settings['use_idm']
+        self.idm_path = find_idm_path()
         self.root = tk.Tk()
         if hidden:
             self.root.withdraw()
@@ -1529,8 +2745,9 @@ class TtkApp(BaseApp):
         ttk.Label(header, text='洛雪音乐桌面版 · 自定义音源批量导入、更新、备份与清除', style='Muted.TLabel').grid(row=1, column=0, sticky='w')
         self.path_label = ttk.Label(header, text='', style='Muted.TLabel')
         self.path_label.grid(row=0, column=1, rowspan=2, sticky='e', padx=(8, 10))
-        ttk.Button(header, text='重新定位', command=self.do_relocate).grid(row=0, column=2, rowspan=2, sticky='e', padx=(0, 4))
-        ttk.Button(header, text='打开数据目录', command=self.do_open_data_dir).grid(row=0, column=3, rowspan=2, sticky='e', padx=(4, 0))
+        ttk.Button(header, text='⚙', command=self.do_open_settings, width=4).grid(row=0, column=2, rowspan=2, sticky='e', padx=(0, 4))
+        ttk.Button(header, text='重新定位', command=self.do_relocate).grid(row=0, column=3, rowspan=2, sticky='e', padx=(0, 4))
+        ttk.Button(header, text='打开数据目录', command=self.do_open_data_dir).grid(row=0, column=4, rowspan=2, sticky='e', padx=(4, 0))
 
         main = ttk.Frame(self.root)
         main.grid(row=1, column=0, sticky='nsew', padx=12, pady=4)
@@ -1618,13 +2835,15 @@ class TtkApp(BaseApp):
         ttk.Label(right, text='提示：修改 user_api.json 后需重启 LX Music 桌面版才会生效',
                   style='Muted.TLabel').grid(row=3, column=0, columnspan=2, sticky='w', pady=(2, 0))
 
-        # ----- 底部：备份 + 日志 -----
+        # ----- 底部：备份 + 订阅 + 日志 -----
         bottom = ttk.Frame(self.root)
         bottom.grid(row=2, column=0, sticky='ew', padx=12, pady=(4, 2))
         bottom.grid_columnconfigure(0, weight=2, uniform='bot')
         bottom.grid_columnconfigure(1, weight=3, uniform='bot')
+        bottom.grid_columnconfigure(2, weight=3, uniform='bot')
         bk = ttk.Frame(bottom, style='Card.TFrame', padding=12)
         bk.grid(row=0, column=0, sticky='nsew', padx=(0, 5))
+        self._bk_card = bk
         bk.grid_columnconfigure(0, weight=1)
         bhead = ttk.Frame(bk, style='Card.TFrame')
         bhead.grid(row=0, column=0, sticky='ew')
@@ -1642,8 +2861,50 @@ class TtkApp(BaseApp):
                                  font=(FONT_FAMILY, 9), height=5, selectmode='extended', exportselection=False)
         self.bk_box.grid(row=1, column=0, sticky='ew', pady=(6, 0))
         self.bk_box.bind('<<ListboxSelect>>', self._on_bk_select)
+        sub = ttk.Frame(bottom, style='Card.TFrame', padding=12)
+        sub.grid(row=0, column=1, sticky='nsew', padx=(5, 5))
+        sub.grid_columnconfigure(0, weight=1)
+        shead = ttk.Frame(sub, style='Card.TFrame')
+        shead.grid(row=0, column=0, sticky='ew')
+        shead.grid_columnconfigure(1, weight=1)
+        ttk.Label(shead, text='订阅更新', style='CardTitle.TLabel').grid(row=0, column=0, sticky='w')
+        sbtns = ttk.Frame(shead, style='Card.TFrame')
+        sbtns.grid(row=0, column=1, sticky='e')
+        ttk.Button(sbtns, text='添加订阅', style='Accent.TButton', command=self.do_add_subscription).pack(side='left', padx=2)
+        ttk.Button(sbtns, text='检查更新', command=self.do_check_subscriptions).pack(side='left', padx=2)
+        ttk.Button(sbtns, text='一键更新', command=self.do_update_all_subscriptions).pack(side='left', padx=2)
+        ttk.Button(sbtns, text='打开目录', command=self.do_open_download_dir).pack(side='left', padx=2)
+        self.sub_tree = ttk.Treeview(sub, columns=('repo', 'st'), show='headings', height=5, selectmode='extended')
+        self.sub_tree.heading('repo', text='仓库')
+        self.sub_tree.heading('st', text='状态')
+        self.sub_tree.column('repo', width=170, anchor='w')
+        self.sub_tree.column('st', width=90, anchor='w')
+        self.sub_tree.grid(row=1, column=0, sticky='ew', pady=(6, 0))
+        self.sub_tree.bind('<Button-1>', self._on_sub_click)
+        self.sub_tree.bind('<Double-1>', self._on_sub_double)
+        vsbs = ttk.Scrollbar(sub, orient='vertical', command=self.sub_tree.yview)
+        self.sub_tree.configure(yscrollcommand=vsbs.set)
+        vsbs.grid(row=1, column=1, sticky='ns', pady=(6, 0))
+        setrow = ttk.Frame(sub, style='Card.TFrame')
+        setrow.grid(row=2, column=0, columnspan=2, sticky='ew', padx=14, pady=(6, 0))
+        ttk.Label(setrow, text='镜像', style='Muted.TLabel').pack(side='left')
+        self.mirror_entry = ttk.Entry(setrow, width=16)
+        self.mirror_entry.pack(side='left', padx=6)
+        self.mirror_entry.insert(0, self.settings['mirror'])
+        self._setup_placeholder(self.mirror_entry, '例如 https://ghfast.top')
+        self.mirror_entry.bind('<Return>', lambda e: self.do_set_mirror(self.mirror_entry.get()))
+        self.mirror_entry.bind('<FocusOut>', lambda e: self.do_set_mirror(self.mirror_entry.get()))
+        self.mirror_combo = ttk.Combobox(setrow, values=['直连', 'gh-proxy.com', 'ghfast.top', 'ghproxy.net', 'gh.api.99988866.xyz'],
+                                         width=12, state='readonly')
+        self.mirror_combo.bind('<<ComboboxSelected>>', lambda e: self._on_mirror_preset(self.mirror_combo.get()))
+        self.mirror_combo.pack(side='left', padx=6)
+        self.idm_var = tk.BooleanVar(value=bool(self.use_idm and self.idm_path))
+        WebCheck(setrow, variable=self.idm_var, command=lambda: self.do_toggle_idm(self.idm_var.get())).pack(side='left', padx=(10, 4), pady=4)
+        ttk.Label(setrow, text='IDM 下载', style='Muted.TLabel').pack(side='left')
+
         lg = ttk.Frame(bottom, style='Card.TFrame', padding=12)
-        lg.grid(row=0, column=1, sticky='nsew', padx=(5, 0))
+        lg.grid(row=0, column=2, sticky='nsew', padx=(5, 0))
+        self._lg_card = lg
         lg.grid_columnconfigure(0, weight=1)
         lg.grid_rowconfigure(1, weight=1)
         lhead = ttk.Frame(lg, style='Card.TFrame')
@@ -1746,6 +3007,226 @@ class TtkApp(BaseApp):
             if f['name'] in self.checked_backups:
                 self.bk_box.selection_set(i)
 
+    # ---------------- 订阅 ----------------
+    def _on_sub_click(self, event):
+        row = self.sub_tree.identify_row(event.y)
+        if row and 0 <= int(row) < len(self.subscriptions):
+            self.do_show_subscription_sources(self.subscriptions[int(row)])
+
+    def _on_sub_double(self, event):
+        row = self.sub_tree.identify_row(event.y)
+        if row and 0 <= int(row) < len(self.subscriptions):
+            self.do_update_subscription(self.subscriptions[int(row)])
+
+    def _view_refresh_subscriptions(self):
+        tree = self.sub_tree
+        tree.delete(*tree.get_children())
+        tree.tag_configure('cur', background=self.C['card2'], foreground=self.C['text'])
+        for i, sub in enumerate(self.subscriptions):
+            tag = sub.get('last_tag')
+            tree.insert('', 'end', iid=str(i),
+                        values=(short(sub.get('repo', ''), 26), ('已用 ' + tag) if tag else '未导入'),
+                        tags=('cur',) if sub.get('repo') == self._current_sub else ())
+
+    def _view_apply_backup_visible(self):
+        try:
+            if self.settings.get('backup_enabled', True):
+                self._bk_card.grid()
+            else:
+                self._bk_card.grid_remove()
+        except Exception:
+            pass
+
+    def _view_apply_log_visible(self):
+        try:
+            show = self.settings.get('log_enabled', True) and self.settings.get('log_window', True)
+            if show:
+                self._lg_card.grid()
+            else:
+                self._lg_card.grid_remove()
+        except Exception:
+            pass
+
+    def _view_refresh_settings_row(self):
+        try:
+            self.idm_var.set(bool(self.use_idm and self.idm_path))
+        except Exception:
+            pass
+
+    def _pick_dir_to(self, entry, cb):
+        d = filedialog.askdirectory(parent=self.root, title='选择文件夹',
+                                    initialdir=entry.get() or self.last_folder)
+        if d:
+            entry.delete(0, 'end')
+            entry.insert(0, d)
+            cb(d)
+
+    def _on_settings_close(self):
+        try:
+            self._settings_win.destroy()
+        except Exception:
+            pass
+        self._settings_win = None
+
+    def _open_cfg_sub_dir(self):
+        sel = self.cfg_sublist.curselection()
+        if not sel:
+            self._info('提示', '请先选择要打开的订阅')
+            return
+        sub = next((s for s in self.subscriptions if s.get('repo') == self.cfg_sublist.get(sel[0])), None)
+        if sub:
+            self.do_open_download_dir(sub)
+
+    def _delete_cfg_sub(self):
+        sel = self.cfg_sublist.curselection()
+        if not sel:
+            self._info('提示', '请先选择要删除的订阅')
+            return
+        sub = next((s for s in self.subscriptions if s.get('repo') == self.cfg_sublist.get(sel[0])), None)
+        if sub:
+            self.do_delete_subscription(sub)
+            try:
+                self.cfg_sublist.delete(sel[0])
+            except Exception:
+                pass
+
+    def do_open_settings(self):
+        C = self.C
+        if self._settings_win is not None:
+            try:
+                if self._settings_win.winfo_exists():
+                    self._settings_win.lift()
+                    return
+            except Exception:
+                pass
+        win = tk.Toplevel(self.root)
+        self._settings_win = win
+        win.title('设置')
+        win.configure(bg=C['bg'])
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.protocol('WM_DELETE_WINDOW', self._on_settings_close)
+        win.grid_columnconfigure(0, weight=1)
+
+        def sec(title, row):
+            f = tk.Frame(win, bg=C['card'], highlightthickness=1, highlightbackground=C['border'])
+            f.grid(row=row, column=0, sticky='ew', padx=16, pady=(10, 0))
+            f.grid_columnconfigure(1, weight=1)
+            tk.Label(f, text=title, bg=C['card'], fg=C['text'], font=(FONT_FAMILY, 12, 'bold')).grid(
+                row=0, column=0, columnspan=3, sticky='w', padx=14, pady=(10, 4))
+            return f
+
+        def wlab(f, r, text, col=0):
+            tk.Label(f, text=text, bg=C['card'], fg=C['text'], font=(FONT_FAMILY, 10), anchor='w').grid(
+                row=r, column=col, sticky='w', padx=(14, 8), pady=4)
+
+        def wsub(f, r, text):
+            tk.Label(f, text=text, bg=C['card'], fg=C['faint'], font=(FONT_FAMILY, 9), anchor='w').grid(
+                row=r, column=1, columnspan=2, sticky='w', padx=14, pady=(0, 4))
+
+        def wentry(f, r, value, on_change, width=34):
+            e = tk.Entry(f, bg=C['field'], fg=C['text'], insertbackground=C['text'], relief='flat',
+                         highlightthickness=1, highlightbackground=C['border'],
+                         font=(FONT_FAMILY, 10), width=width)
+            e.grid(row=r, column=1, sticky='ew', padx=(0, 8), pady=4)
+            e.insert(0, value)
+            e.bind('<Return>', lambda ev: on_change(e.get()))
+            e.bind('<FocusOut>', lambda ev: on_change(e.get()))
+            return e
+
+        def wcheck(f, r, var, label, on_toggle):
+            WebCheck(f, variable=var, command=on_toggle).grid(row=r, column=0, padx=(14, 4), pady=4)
+            wlab(f, r, label, 1)
+
+        f1 = sec('一、备份配置', 0)
+        self.cfg_backup_var = tk.BooleanVar(value=self.settings.get('backup_enabled', True))
+        wcheck(f1, 1, self.cfg_backup_var, '自动备份（每次写操作前备份；关闭后隐藏备份模块）',
+               lambda: self.do_set_backup_enabled(self.cfg_backup_var.get()))
+        wlab(f1, 2, '备份文件夹', 0)
+        self.cfg_backup_entry = wentry(f1, 2, effective_backup_dir(self.settings), self.do_set_backup_dir)
+        ttk.Button(f1, text='浏览…', command=lambda: self._pick_dir_to(self.cfg_backup_entry, self.do_set_backup_dir)).grid(
+            row=2, column=2, padx=(0, 14), pady=4)
+        wsub(f1, 3, '更改目录时可将旧备份迁移到新位置')
+
+        f2 = sec('二、订阅配置', 1)
+        wlab(f2, 1, '下载目录', 0)
+        self.cfg_dl_entry = wentry(f2, 1, effective_download_dir(self.settings), self.do_set_download_dir)
+        ttk.Button(f2, text='浏览…', command=lambda: self._pick_dir_to(self.cfg_dl_entry, self.do_set_download_dir)).grid(
+            row=1, column=2, padx=(0, 14), pady=4)
+        wsub(f2, 2, '每个订阅存放于 下载目录/<仓库名>/ 子文件夹；zip 附件自动解压')
+        self.cfg_idm_var = tk.BooleanVar(value=bool(self.use_idm and self.idm_path))
+        wcheck(f2, 3, self.cfg_idm_var, '使用 IDM 下载（检测到 IDM 时可用）',
+               lambda: self.do_toggle_idm(self.cfg_idm_var.get()))
+        self.cfg_hist_var = tk.BooleanVar(value=self.settings.get('keep_history', False))
+        wcheck(f2, 4, self.cfg_hist_var, '保存历史订阅（更新前归档旧版本到 history 子目录，默认关闭）',
+               lambda: self.do_set_keep_history(self.cfg_hist_var.get()))
+        wlab(f2, 5, '已有订阅', 0)
+        self.cfg_sublist = tk.Listbox(f2, height=3, bg=C['field'], fg=C['text'], relief='flat',
+                                      highlightthickness=1, highlightbackground=C['border'],
+                                      font=(FONT_FAMILY, 10), selectbackground=C['card2'],
+                                      selectforeground=C['text'])
+        self.cfg_sublist.grid(row=5, column=1, columnspan=2, sticky='ew', padx=(0, 14), pady=4)
+        for s in self.subscriptions:
+            self.cfg_sublist.insert('end', s.get('repo', ''))
+        ttk.Button(f2, text='打开文件夹', command=self._open_cfg_sub_dir).grid(row=6, column=1, sticky='w', padx=(0, 8), pady=(0, 10))
+        ttk.Button(f2, text='删除订阅', command=self._delete_cfg_sub).grid(row=6, column=2, sticky='w', padx=(0, 14), pady=(0, 10))
+
+        f3 = sec('三、日志配置', 2)
+        self.cfg_log_var = tk.BooleanVar(value=self.settings.get('log_enabled', True))
+        wcheck(f3, 1, self.cfg_log_var, '记录日志（写入 config/logs/app.log）',
+               lambda: self.do_set_log_enabled(self.cfg_log_var.get()))
+        self.cfg_logwin_var = tk.BooleanVar(
+            value=self.settings.get('log_enabled', True) and self.settings.get('log_window', True))
+        wcheck(f3, 2, self.cfg_logwin_var, '显示日志窗口（需先开启记录日志）',
+               lambda: self.do_set_log_window(self.cfg_logwin_var.get()))
+
+        btns = ttk.Frame(win)
+        btns.grid(row=3, column=0, sticky='e', padx=16, pady=12)
+        ttk.Button(btns, text='关闭', command=self._on_settings_close).pack(side='left')
+        try:
+            win.update_idletasks()
+            w = max(620, win.winfo_reqwidth() + 30)
+            h = win.winfo_reqheight() + 12
+            x = self.root.winfo_rootx() + max((self.root.winfo_width() - w) // 2, 0)
+            y = self.root.winfo_rooty() + max((self.root.winfo_height() - h) // 2, 0)
+            win.geometry('{}x{}+{}+{}'.format(w, h, x, y))
+        except Exception:
+            pass
+
+    def _view_input(self, title, prompt):
+        dlg = tk.Toplevel(self.root)
+        dlg.title(title)
+        dlg.configure(bg=self.C['card'])
+        dlg.transient(self.root)
+        tk.Label(dlg, text=prompt, bg=self.C['card'], fg=self.C['text'], wraplength=400, justify='left',
+                 font=(FONT_FAMILY, 10)).pack(padx=20, pady=(16, 10), anchor='w')
+        var = tk.StringVar()
+        e = ttk.Entry(dlg, textvariable=var)
+        e.pack(padx=20, pady=(0, 12), fill='x')
+        result = {'val': None}
+
+        def ok():
+            result['val'] = var.get().strip()
+            dlg.destroy()
+
+        e.bind('<Return>', lambda ev: ok())
+        btns = ttk.Frame(dlg)
+        btns.pack(pady=(0, 14))
+        ttk.Button(btns, text='取消', command=dlg.destroy).pack(side='left', padx=8)
+        ttk.Button(btns, text='确定', style='Accent.TButton', command=ok).pack(side='left', padx=8)
+        try:
+            dlg.update_idletasks()
+            w = max(460, dlg.winfo_reqwidth() + 40)
+            h = dlg.winfo_reqheight() + 16
+            x = self.root.winfo_rootx() + max((self.root.winfo_width() - w) // 2, 0)
+            y = self.root.winfo_rooty() + max((self.root.winfo_height() - h) // 2, 0)
+            dlg.geometry('{}x{}+{}+{}'.format(w, h, x, y))
+        except Exception:
+            pass
+        dlg.grab_set()
+        dlg.wait_window()
+        return result['val']
+
     def _view_log(self, text, level='info'):
         try:
             self.logbox.configure(state='normal')
@@ -1831,6 +3312,8 @@ def run_selftest(force_ttk=False):
         pass
     print('== LX Music 音源工具 自检 ==')
     tmp = tempfile.mkdtemp(prefix='lxtool_test_')
+    globals()['subscriptions_path'] = lambda: os.path.join(tmp, 'subscriptions.json')
+    globals()['settings_path'] = lambda: os.path.join(tmp, 'settings.json')
     src = os.path.join(tmp, 'sources')
     os.makedirs(os.path.join(src, 'sub'))
     api = os.path.join(tmp, 'user_api.json')
@@ -1883,12 +3366,68 @@ def run_selftest(force_ttk=False):
         assert len(bm.list_files()) == 1
         report.append('核心逻辑 OK（扫描/解析/导入/更新/去重/备份/读写）')
 
+        # ---- 订阅逻辑（本地，无网络） ----
+        assert parse_repo_ref('guoyue2010/lxmusic-') == ('guoyue2010', 'lxmusic-')
+        assert parse_repo_ref('https://github.com/guoyue2010/lxmusic-/releases') == ('guoyue2010', 'lxmusic-')
+        assert parse_repo_ref('https://github.com/guoyue2010/lxmusic-') == ('guoyue2010', 'lxmusic-')
+        try:
+            parse_repo_ref('随便写写')
+            raise AssertionError('parse_repo_ref 应拒绝无效输入')
+        except ValueError:
+            pass
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, 'w') as z:
+            z.writestr('src/a.js', '/*!\\n * @name zip源\\n * @version 1.0\\n */\\n;(function(){})()')
+            z.writestr('readme.txt', 'not a js')
+        items = _extract_js_from_zip(buf.getvalue())
+        assert len(items) == 1 and items[0][0] == 'src/a.js'
+        save_subscriptions([{'repo': 'a/b', 'last_tag': 'v1'}])
+        subs = load_subscriptions()
+        assert len(subs) == 1 and subs[0]['repo'] == 'a/b' and subs[0]['last_tag'] == 'v1'
+        # 镜像与设置
+        set_mirror('ghfast.top')
+        assert get_mirror() == 'https://ghfast.top'
+        assert mirrored_url('https://github.com/a/b') == 'https://ghfast.top/https://github.com/a/b'
+        set_mirror('')
+        assert mirrored_url('https://github.com/a/b') == 'https://github.com/a/b'
+        save_settings(dict(DEFAULT_SETTINGS, mirror='', use_idm=False))
+        st = load_settings()
+        assert st['mirror'] == '' and st['use_idm'] is False
+        assert st['backup_enabled'] is True and st['log_enabled'] is True and st['log_window'] is True
+        save_settings(dict(DEFAULT_SETTINGS, mirror='https://gh-proxy.com', use_idm=True, keep_history=True))
+        st = load_settings()
+        assert st['mirror'] == 'https://gh-proxy.com' and st['use_idm'] is True and st['keep_history'] is True
+        idm_path = find_idm_path()
+        print('IDM 探测结果:', idm_path)
+        report.append('订阅逻辑 OK（仓库解析/zip 解包/状态存取/镜像设置）')
+
         # ---- UI 冒烟（隐藏窗口） ----
         if not force_ttk:
             if ensure_customtkinter():
                 try:
                     app = CtkApp(user_api_path=api, backup_dir=bk, auto_confirm=True, hidden=True)
                     app.root.update_idletasks()
+                    app.subscriptions = [{'repo': 'guoyue2010/lxmusic-', 'last_tag': 'V260810'}]
+                    app._view_refresh_subscriptions()
+                    app.root.update_idletasks()
+                    assert len(app.sub_rows) == 1
+                    # WebCheck 网页风格复选框
+                    wc = WebCheck(app.root)
+                    assert wc.var.get() is False
+                    wc._on_click(None)
+                    assert wc.var.get() is True
+                    wc.destroy()
+                    # 单击订阅 → 把本地已下载音源加载进待导入列表
+                    subdir = os.path.join(tmp, 'dl', 'a', 'b')
+                    os.makedirs(subdir)
+                    with open(os.path.join(subdir, 'x.js'), 'w', encoding='utf-8') as f:
+                        f.write('/*!\n * @name 订阅源\n * @version 1.0\n */\n;(function(){})()')
+                    app.settings['download_dir'] = os.path.join(tmp, 'dl')
+                    app.subscriptions = [{'repo': 'a/b', 'last_tag': 'v1'}]
+                    app.do_show_subscription_sources(app.subscriptions[0])
+                    app.root.update_idletasks()
+                    assert len(app.candidates) == 1 and app.candidates[0].name == '订阅源'
+                    app.candidates = []
                     app.do_scan_folder(src)
                     app.root.update_idletasks()
                     assert len(app.candidates) == 3
@@ -1913,6 +3452,10 @@ def run_selftest(force_ttk=False):
         try:
             app2 = TtkApp(user_api_path=api, backup_dir=bk, auto_confirm=True, hidden=True)
             app2.root.update_idletasks()
+            app2.subscriptions = [{'repo': 'guoyue2010/lxmusic-', 'last_tag': 'V260810'}]
+            app2._view_refresh_subscriptions()
+            app2.root.update_idletasks()
+            assert len(app2.sub_tree.get_children()) == 1
             app2.do_scan_folder(src)
             app2.root.update_idletasks()
             app2.do_import(all_selected=True)
