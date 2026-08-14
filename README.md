@@ -3,6 +3,7 @@
 针对 [lx-music-desktop](https://github.com/lyswhut/lx-music-desktop)（洛雪音乐桌面版）的自定义音源批量管理工具，带图形界面，一站式完成音源的导入、更新、备份、还原与清除。
 
 > 本工具只做「管理」，不内置、不提供任何音源脚本。
+> 使用Deepseek辅助开发（其实是找了个项目测试了一下deepseek
 
 ## 功能
 
