@@ -95,7 +95,7 @@ LOG_COLORS = {
 
 
 class WebCheck(tk.Canvas):
-    """网页风格复选框：小方框 + 对勾，支持悬停反馈（替代系统 Checkbutton）。"""
+    """网页风格复选框：小方框 + 对勾，支持悬停反馈与禁用态（替代系统 Checkbutton）。"""
 
     def __init__(self, master, variable=None, command=None, size=18, colors=None):
         self._size = size
@@ -103,6 +103,7 @@ class WebCheck(tk.Canvas):
         self.var = variable if variable is not None else tk.BooleanVar(value=False)
         self._command = command
         self._hover = False
+        self._enabled = True
         try:
             bg = master.cget('bg')
         except Exception:
@@ -115,12 +116,22 @@ class WebCheck(tk.Canvas):
         self.var.trace_add('write', lambda *a: self._draw())
         self._draw()
 
+    def set_state(self, enabled):
+        """启用 / 禁用（禁用时置灰且不可点击）。"""
+        self._enabled = bool(enabled)
+        self._hover = False
+        self._draw()
+
     def _on_click(self, _e):
+        if not self._enabled:
+            return
         self.var.set(not self.var.get())
         if self._command:
             self._command()
 
     def _set_hover(self, h):
+        if not self._enabled:
+            h = False
         self._hover = h
         self._draw()
 
@@ -129,12 +140,19 @@ class WebCheck(tk.Canvas):
         c.delete('all')
         s = self._size
         if self.var.get():
-            c.create_rectangle(1.5, 1.5, s - 1.5, s - 1.5, fill=self._colors['accent'],
-                               outline=self._colors['accent'], width=1)
+            if self._enabled:
+                fill = outline = self._colors['accent']
+            else:
+                fill = outline = self._colors['faint']
+            c.create_rectangle(1.5, 1.5, s - 1.5, s - 1.5, fill=fill,
+                               outline=outline, width=1)
             c.create_line(5, s / 2 + 0.5, s / 2 - 1, s - 5, s - 5, 5,
                           fill='#fffaf5', width=2, capstyle=tk.ROUND, joinstyle=tk.ROUND)
         else:
-            outline = self._colors['hover'] if self._hover else self._colors['faint']
+            if self._enabled:
+                outline = self._colors['hover'] if self._hover else self._colors['faint']
+            else:
+                outline = self._colors['border']
             c.create_rectangle(1.5, 1.5, s - 1.5, s - 1.5, fill='', outline=outline, width=1)
 
 
@@ -1489,6 +1507,7 @@ class BaseApp:
             self.backups = BackupManager(self.backup_dir)
             self._view_apply_backup_visible()
             self._view_apply_log_visible()
+            self._view_rebalance_bottom()
             self._view_refresh_settings_row()
             self._view_status()
         except Exception as e:
@@ -1551,6 +1570,7 @@ class BaseApp:
         save_settings(self.settings)
         self.log('日志记录已{}'.format('开启' if enable else '关闭'), 'ok')
         self.apply_settings()
+        self._view_refresh_cfg_logwin()
 
     def do_set_log_window(self, enable):
         if enable and not self.settings.get('log_enabled', True):
@@ -1647,6 +1667,12 @@ class BaseApp:
         raise NotImplementedError
 
     def _view_refresh_settings_row(self):
+        pass
+
+    def _view_rebalance_bottom(self):
+        pass
+
+    def _view_refresh_cfg_logwin(self):
         pass
 
     def _view_input(self, title, prompt):
@@ -1863,6 +1889,7 @@ class CtkApp(BaseApp):
         bottom.grid_columnconfigure(0, weight=2, uniform='bot')
         bottom.grid_columnconfigure(1, weight=3, uniform='bot')
         bottom.grid_columnconfigure(2, weight=3, uniform='bot')
+        self._bottom = bottom
         self._build_bottom(bottom)
 
         # ---------- 状态栏 ----------
@@ -2043,7 +2070,11 @@ class CtkApp(BaseApp):
             dropdown_text_color=C['text'], font=self.f_tiny)
         self.mirror_combo.pack(side='left', padx=6)
         self.idm_var = tk.BooleanVar(value=bool(self.use_idm and self.idm_path))
-        WebCheck(setrow, variable=self.idm_var, command=lambda: self.do_toggle_idm(self.idm_var.get())).pack(side='left', padx=(10, 4), pady=5)
+        self.idm_check = WebCheck(setrow, variable=self.idm_var,
+                                  command=lambda: self.do_toggle_idm(self.idm_var.get()))
+        self.idm_check.pack(side='left', padx=(10, 4), pady=5)
+        if not self.idm_path:
+            self.idm_check.set_state(False)
         tk.Label(setrow, text='IDM 下载', bg=C['card'], fg=C['muted'], font=self.f_tiny).pack(side='left')
 
         lg = ctk.CTkFrame(bottom, fg_color=C['card'], corner_radius=8)
@@ -2504,12 +2535,19 @@ class CtkApp(BaseApp):
         # ---- 三、日志配置 ----
         f3 = sec('三、日志配置', 2)
         self.cfg_log_var = tk.BooleanVar(value=self.settings.get('log_enabled', True))
-        wcheck(f3, 1, self.cfg_log_var, '记录日志（写入 config/logs/app.log）',
-               lambda: self.do_set_log_enabled(self.cfg_log_var.get()))
+        self.cfg_log_check = WebCheck(f3, variable=self.cfg_log_var,
+                                      command=lambda: self.do_set_log_enabled(self.cfg_log_var.get()))
+        self.cfg_log_check.grid(row=1, column=0, padx=(14, 4), pady=4)
+        wlab(f3, 1, '记录日志（写入 config/logs/app.log）', 1)
         self.cfg_logwin_var = tk.BooleanVar(
             value=self.settings.get('log_enabled', True) and self.settings.get('log_window', True))
-        wcheck(f3, 2, self.cfg_logwin_var, '显示日志窗口（需先开启记录日志）',
-               lambda: self.do_set_log_window(self.cfg_logwin_var.get()))
+        self.cfg_logwin_check = WebCheck(f3, variable=self.cfg_logwin_var,
+                                         command=lambda: self.do_set_log_window(self.cfg_logwin_var.get()))
+        self.cfg_logwin_check.grid(row=2, column=0, padx=(14, 4), pady=4)
+        self.cfg_logwin_label = ctk.CTkLabel(f3, text='显示日志窗口（需先开启记录日志）', font=self.f_small,
+                                             text_color=C['text'], anchor='w')
+        self.cfg_logwin_label.grid(row=2, column=1, columnspan=2, sticky='w', padx=(14, 8), pady=4)
+        self._view_refresh_cfg_logwin()
 
         bottom_row = ctk.CTkFrame(win, fg_color='transparent')
         bottom_row.grid(row=3, column=0, sticky='e', padx=16, pady=12)
@@ -2529,6 +2567,46 @@ class CtkApp(BaseApp):
             except Exception:
                 pass
             self._fade_in(win, steps=6, interval=18)
+
+    def _view_rebalance_bottom(self):
+        # 隐藏某个底部模块时重排网格，让剩余卡片自动瓜分全部宽度
+        try:
+            show_bk = self.settings.get('backup_enabled', True)
+            show_lg = self.settings.get('log_enabled', True) and self.settings.get('log_window', True)
+            cards = []
+            weights = []
+            if show_bk:
+                cards.append(self._bk_card)
+                weights.append(2)
+            cards.append(self._sub_card)
+            weights.append(3)
+            if show_lg:
+                cards.append(self._lg_card)
+                weights.append(3)
+            for i, card in enumerate(cards):
+                left = 0 if i == 0 else 6
+                right = 0 if i == len(cards) - 1 else 6
+                card.grid(row=0, column=i, sticky='nsew', padx=(left, right))
+            for i in range(3):
+                w = weights[i] if i < len(weights) else 0
+                # 权重为 0 的列退出 uniform 组，否则 Tk 会按 weight=1 分走宽度
+                self._bottom.grid_columnconfigure(i, weight=w, uniform=('bot' if w > 0 else ''))
+        except Exception:
+            pass
+
+    def _view_refresh_cfg_logwin(self):
+        # 记录日志关闭时：显示日志窗口自动关闭并置灰；开启时恢复可点
+        C = self.C
+        try:
+            enabled = self.settings.get('log_enabled', True)
+            if hasattr(self, 'cfg_logwin_var'):
+                self.cfg_logwin_var.set(enabled and self.settings.get('log_window', True))
+            if hasattr(self, 'cfg_logwin_check'):
+                self.cfg_logwin_check.set_state(enabled)
+            if hasattr(self, 'cfg_logwin_label'):
+                self.cfg_logwin_label.configure(text_color=C['text'] if enabled else C['faint'])
+        except Exception:
+            pass
 
     def _view_log(self, text, level='info'):
         try:
@@ -2841,6 +2919,7 @@ class TtkApp(BaseApp):
         bottom.grid_columnconfigure(0, weight=2, uniform='bot')
         bottom.grid_columnconfigure(1, weight=3, uniform='bot')
         bottom.grid_columnconfigure(2, weight=3, uniform='bot')
+        self._bottom = bottom
         bk = ttk.Frame(bottom, style='Card.TFrame', padding=12)
         bk.grid(row=0, column=0, sticky='nsew', padx=(0, 5))
         self._bk_card = bk
@@ -2899,7 +2978,11 @@ class TtkApp(BaseApp):
         self.mirror_combo.bind('<<ComboboxSelected>>', lambda e: self._on_mirror_preset(self.mirror_combo.get()))
         self.mirror_combo.pack(side='left', padx=6)
         self.idm_var = tk.BooleanVar(value=bool(self.use_idm and self.idm_path))
-        WebCheck(setrow, variable=self.idm_var, command=lambda: self.do_toggle_idm(self.idm_var.get())).pack(side='left', padx=(10, 4), pady=4)
+        self.idm_check = WebCheck(setrow, variable=self.idm_var,
+                                  command=lambda: self.do_toggle_idm(self.idm_var.get()))
+        self.idm_check.pack(side='left', padx=(10, 4), pady=4)
+        if not self.idm_path:
+            self.idm_check.set_state(False)
         ttk.Label(setrow, text='IDM 下载', style='Muted.TLabel').pack(side='left')
 
         lg = ttk.Frame(bottom, style='Card.TFrame', padding=12)
@@ -3173,12 +3256,19 @@ class TtkApp(BaseApp):
 
         f3 = sec('三、日志配置', 2)
         self.cfg_log_var = tk.BooleanVar(value=self.settings.get('log_enabled', True))
-        wcheck(f3, 1, self.cfg_log_var, '记录日志（写入 config/logs/app.log）',
-               lambda: self.do_set_log_enabled(self.cfg_log_var.get()))
+        self.cfg_log_check = WebCheck(f3, variable=self.cfg_log_var,
+                                      command=lambda: self.do_set_log_enabled(self.cfg_log_var.get()))
+        self.cfg_log_check.grid(row=1, column=0, padx=(14, 4), pady=4)
+        wlab(f3, 1, '记录日志（写入 config/logs/app.log）', 1)
         self.cfg_logwin_var = tk.BooleanVar(
             value=self.settings.get('log_enabled', True) and self.settings.get('log_window', True))
-        wcheck(f3, 2, self.cfg_logwin_var, '显示日志窗口（需先开启记录日志）',
-               lambda: self.do_set_log_window(self.cfg_logwin_var.get()))
+        self.cfg_logwin_check = WebCheck(f3, variable=self.cfg_logwin_var,
+                                         command=lambda: self.do_set_log_window(self.cfg_logwin_var.get()))
+        self.cfg_logwin_check.grid(row=2, column=0, padx=(14, 4), pady=4)
+        self.cfg_logwin_label = tk.Label(f3, text='显示日志窗口（需先开启记录日志）', bg=C['card'],
+                                         fg=C['text'], font=(FONT_FAMILY, 10), anchor='w')
+        self.cfg_logwin_label.grid(row=2, column=1, columnspan=2, sticky='w', padx=(14, 8), pady=4)
+        self._view_refresh_cfg_logwin()
 
         btns = ttk.Frame(win)
         btns.grid(row=3, column=0, sticky='e', padx=16, pady=12)
@@ -3190,6 +3280,46 @@ class TtkApp(BaseApp):
             x = self.root.winfo_rootx() + max((self.root.winfo_width() - w) // 2, 0)
             y = self.root.winfo_rooty() + max((self.root.winfo_height() - h) // 2, 0)
             win.geometry('{}x{}+{}+{}'.format(w, h, x, y))
+        except Exception:
+            pass
+
+    def _view_rebalance_bottom(self):
+        # 隐藏某个底部模块时重排网格，让剩余卡片自动瓜分全部宽度
+        try:
+            show_bk = self.settings.get('backup_enabled', True)
+            show_lg = self.settings.get('log_enabled', True) and self.settings.get('log_window', True)
+            cards = []
+            weights = []
+            if show_bk:
+                cards.append(self._bk_card)
+                weights.append(2)
+            cards.append(self._sub_card)
+            weights.append(3)
+            if show_lg:
+                cards.append(self._lg_card)
+                weights.append(3)
+            for i, card in enumerate(cards):
+                left = 0 if i == 0 else 5
+                right = 0 if i == len(cards) - 1 else 5
+                card.grid(row=0, column=i, sticky='nsew', padx=(left, right))
+            for i in range(3):
+                w = weights[i] if i < len(weights) else 0
+                # 权重为 0 的列退出 uniform 组，否则 Tk 会按 weight=1 分走宽度
+                self._bottom.grid_columnconfigure(i, weight=w, uniform=('bot' if w > 0 else ''))
+        except Exception:
+            pass
+
+    def _view_refresh_cfg_logwin(self):
+        # 记录日志关闭时：显示日志窗口自动关闭并置灰；开启时恢复可点
+        C = self.C
+        try:
+            enabled = self.settings.get('log_enabled', True)
+            if hasattr(self, 'cfg_logwin_var'):
+                self.cfg_logwin_var.set(enabled and self.settings.get('log_window', True))
+            if hasattr(self, 'cfg_logwin_check'):
+                self.cfg_logwin_check.set_state(enabled)
+            if hasattr(self, 'cfg_logwin_label'):
+                self.cfg_logwin_label.configure(fg=C['text'] if enabled else C['faint'])
         except Exception:
             pass
 
