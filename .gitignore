@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+lx_backups/
+build/
+dist/
+*.spec
