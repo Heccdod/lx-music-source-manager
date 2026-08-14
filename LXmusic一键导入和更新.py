@@ -487,22 +487,6 @@ def _extract_js_from_zip(data, cap=20 * 1024 * 1024):
     return out
 
 
-def scripts_from_asset(asset, src_label):
-    """下载一个 Release 附件（.js 或 .zip），解析出其中的全部音源脚本。"""
-    name = asset.get('name', '')
-    data = download_bytes(asset['browser_download_url'])
-    if name.lower().endswith('.zip'):
-        items = _extract_js_from_zip(data)
-    else:
-        items = [(name, data)]
-    scripts = []
-    for fname, content in items:
-        text, enc = decode_script_bytes(content)
-        meta = parse_script_meta(text, fallback_name=os.path.splitext(fname)[0])
-        scripts.append(SourceScript(src_label, fname, text, meta, enc, _BLOCK_RE.match(text) is None))
-    return scripts
-
-
 def tool_dir():
     return os.path.dirname(os.path.abspath(sys.argv[0]))
 
@@ -539,6 +523,8 @@ DEFAULT_SETTINGS = {
     'log_enabled': True,
     'log_window': True,
 }
+
+MIRROR_PLACEHOLDER = '例如 https://ghfast.top'
 
 
 def load_subscriptions():
@@ -797,7 +783,6 @@ class BaseApp:
         self.import_mode = 'add'
         self.last_folder = os.path.expanduser('~')
         self.subscriptions = load_subscriptions()
-        self.checked_subs = set()
         self._current_sub = None
         self._settings_win = None
         self._load_data()
@@ -1357,24 +1342,9 @@ class BaseApp:
 
         self._run_task(work, done, '正在检查全部订阅…')
 
-    def do_delete_subscriptions(self):
-        checked = sorted(i for i in self.checked_subs if 0 <= i < len(self.subscriptions))
-        if not checked:
-            self._info('提示', '请先在订阅列表中勾选要删除的订阅')
-            return
-        names = '、'.join(str(self.subscriptions[i].get('repo', '?')) for i in checked[:5])
-        if not self._confirm('确认删除订阅？', '将删除 {} 个订阅：\n{}{}'.format(len(checked), names, ' …' if len(checked) > 5 else '')):
-            return
-        for i in reversed(checked):
-            self.subscriptions.pop(i)
-        self.checked_subs = set()
-        save_subscriptions(self.subscriptions)
-        self._view_refresh_subscriptions()
-        self.log('已删除 {} 个订阅'.format(len(checked)), 'ok')
-
     def do_set_mirror(self, value):
         value = (value or '').strip()
-        if value == '直连' or value.startswith('例如 '):
+        if value == '直连' or value == MIRROR_PLACEHOLDER:
             value = ''
         if value == self.settings['mirror']:
             set_mirror(value)
@@ -1430,7 +1400,13 @@ class BaseApp:
         value = '' if choice == '直连' else choice
         self.mirror_entry.delete(0, 'end')
         self.mirror_entry.insert(0, value)
-        self.mirror_entry.configure(fg=PALETTE['text'])
+        try:
+            self.mirror_entry.configure(fg=PALETTE['text'])
+        except Exception:
+            try:
+                self.mirror_entry.configure(foreground=PALETTE['text'])
+            except Exception:
+                pass
         self.do_set_mirror(value)
 
     def _sub_download_dir(self, sub):
@@ -1466,17 +1442,23 @@ class BaseApp:
                 os.remove(target)
             except OSError:
                 pass
+        idm_ok = False
         if self.use_idm and self.idm_path:
-            url = mirrored_url(asset['browser_download_url'])
-            subprocess.Popen([self.idm_path, '/d', url, '/p', subdir, '/f', os.path.basename(name), '/n', '/s'])
-            deadline = time.time() + 600
-            while time.time() < deadline:
-                if os.path.isfile(target) and os.path.getsize(target) > 0:
-                    break
-                time.sleep(2)
-            else:
-                raise ValueError('等待 IDM 下载超时（10 分钟）：{}'.format(name))
-        else:
+            try:
+                url = mirrored_url(asset['browser_download_url'])
+                subprocess.Popen([self.idm_path, '/d', url, '/p', subdir, '/f', os.path.basename(name), '/n', '/s'])
+                deadline = time.time() + 600
+                while time.time() < deadline:
+                    if os.path.isfile(target) and os.path.getsize(target) > 0:
+                        idm_ok = True
+                        break
+                    time.sleep(2)
+                else:
+                    raise ValueError('等待 IDM 下载超时（10 分钟）：{}'.format(name))
+            except (FileNotFoundError, OSError):
+                # IDM 路径已失效，标记失效并回退内置下载
+                self.idm_path = None
+        if not idm_ok:
             data = download_bytes(asset['browser_download_url'])
             with open(target, 'wb') as f:
                 f.write(data)
@@ -1520,16 +1502,18 @@ class BaseApp:
                 self._unzip_with_password(target, subdir, name)
             except Exception as e:
                 raise ValueError('解压失败：{}'.format(e))
-            try:
-                os.remove(target)
-            except OSError:
-                pass
             items = []
             for root2, dirs2, files2 in os.walk(subdir):
                 dirs2[:] = [d for d in dirs2 if d != 'history']
                 for fn in files2:
                     if fn.lower().endswith('.js'):
                         items.append(os.path.join(root2, fn))
+            if not items:
+                raise ValueError('压缩包内没有找到 .js 音源文件，已保留原压缩包')
+            try:
+                os.remove(target)
+            except OSError:
+                pass
         else:
             items = [target]
         scripts = []
@@ -1605,13 +1589,20 @@ class BaseApp:
 
     def do_set_backup_dir(self, path):
         path = (path or '').strip()
-        if path and not os.path.isdir(path):
+        default_dir = os.path.join(config_dir(), 'backups')
+        if not path:
+            path = default_dir
+            try:
+                os.makedirs(path, exist_ok=True)
+            except Exception:
+                pass
+        if not os.path.isdir(path):
             self._info('提示', '目录不存在，请重新选择')
             return
         old = effective_backup_dir(self.settings)
         if path == old:
             return
-        if old and os.path.isdir(old):
+        if old and os.path.isdir(old) and os.path.normcase(os.path.abspath(old)) != os.path.normcase(os.path.abspath(path)):
             files = [f for f in os.listdir(old) if f.lower().endswith('.json')]
             if files:
                 if not self._confirm('迁移旧备份？', '检测到旧备份目录中还有 {} 个备份文件。\n\n是否将旧备份迁移到新目录？'.format(len(files))):
@@ -1628,9 +1619,14 @@ class BaseApp:
                 except Exception as e:
                     self.log('迁移失败：{}'.format(e), 'error')
                     return
-        self.settings['backup_dir'] = path
+        # 等于默认目录时归一化为空串（表示“使用默认”）
+        if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(default_dir)):
+            self.settings['backup_dir'] = ''
+            self.log('备份文件夹已恢复为默认（config/backups）', 'ok')
+        else:
+            self.settings['backup_dir'] = path
+            self.log('备份文件夹已改为：{}'.format(path), 'ok')
         save_settings(self.settings)
-        self.log('备份文件夹已改为：{}'.format(path or '（默认 config/backups）'), 'ok')
         self.apply_settings()
 
     def do_set_download_dir(self, path):
@@ -2143,7 +2139,7 @@ class CtkApp(BaseApp):
                                      font=self.f_tiny, width=17)
         self.mirror_entry.pack(side='left', padx=6)
         self.mirror_entry.insert(0, self.settings['mirror'])
-        self._setup_placeholder(self.mirror_entry, '例如 https://ghfast.top')
+        self._setup_placeholder(self.mirror_entry, MIRROR_PLACEHOLDER)
         self.mirror_entry.bind('<Return>', lambda e: self.do_set_mirror(self.mirror_entry.get()))
         self.mirror_entry.bind('<FocusOut>', lambda e: self.do_set_mirror(self.mirror_entry.get()))
         self.mirror_combo = ctk.CTkOptionMenu(
@@ -3055,7 +3051,7 @@ class TtkApp(BaseApp):
         self.mirror_entry = ttk.Entry(setrow, width=16)
         self.mirror_entry.pack(side='left', padx=6)
         self.mirror_entry.insert(0, self.settings['mirror'])
-        self._setup_placeholder(self.mirror_entry, '例如 https://ghfast.top')
+        self._setup_placeholder(self.mirror_entry, MIRROR_PLACEHOLDER)
         self.mirror_entry.bind('<Return>', lambda e: self.do_set_mirror(self.mirror_entry.get()))
         self.mirror_entry.bind('<FocusOut>', lambda e: self.do_set_mirror(self.mirror_entry.get()))
         self.mirror_combo = ttk.Combobox(setrow, values=['直连', 'gh-proxy.com', 'ghfast.top', 'ghproxy.net', 'gh.api.99988866.xyz'],
