@@ -18,6 +18,7 @@ LX Music 音源一键导入 / 更新工具
 6. 备份管理：手动生成备份、一键还原备份、查看 / 删除 / 清空备份；所有写操作前自动备份
 7. 已导入音源查看：列表展示 + 详情查看，支持删除所选 / 一键清除全部
 8. GitHub 订阅：添加仓库订阅，一键检查并下载最新 Release 音源，自动以更新模式导入
+   - 解压后自动删除原压缩包；支持加密压缩包（弹窗输入密码，会话内自动记住）
 9. 镜像切换与 IDM：支持 GitHub 镜像前缀加速下载（国内网络友好）；检测到 IDM 时自动调起 IDM 下载，可手动切换内置下载
 
 实现说明
@@ -416,23 +417,52 @@ def source_assets_of(release):
     return out
 
 
-def _safe_extract_zip(zip_path, dest):
-    """安全解压 zip 到目标目录（拦截路径穿越）。"""
+def _safe_extract_zip(zip_path, dest, password=None):
+    """安全解压 zip 到目标目录（拦截路径穿越；支持密码；失败时清理半截文件）。"""
     base = os.path.normcase(os.path.abspath(dest)) + os.sep
+    written = []
     with zipfile.ZipFile(zip_path) as zf:
-        for info in zf.infolist():
-            name = info.filename.replace('\\\\', '/')
-            if name.startswith('/') or '..' in name.split('/'):
-                continue
-            target = os.path.normcase(os.path.abspath(os.path.join(dest, name)))
-            if not target.startswith(base):
-                continue
-            if info.is_dir():
-                os.makedirs(target, exist_ok=True)
-            else:
-                os.makedirs(os.path.dirname(target), exist_ok=True)
-                with open(target, 'wb') as f:
-                    f.write(zf.read(info))
+        try:
+            for info in zf.infolist():
+                name = info.filename.replace('\\\\', '/')
+                if name.startswith('/') or '..' in name.split('/'):
+                    continue
+                target = os.path.normcase(os.path.abspath(os.path.join(dest, name)))
+                if not target.startswith(base):
+                    continue
+                if info.is_dir():
+                    os.makedirs(target, exist_ok=True)
+                else:
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    written.append(target)
+                    with open(target, 'wb') as f:
+                        f.write(zf.read(info, pwd=password))
+        except Exception:
+            for p in written:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            raise
+
+
+_ZIP_PASSWORDS = {}
+
+
+def _try_zip_password(zip_path, dest, pwd):
+    """按多种常见编码尝试 zip 解压密码（windows 压缩包常用 gbk/cp437）。"""
+    if not pwd:
+        _safe_extract_zip(zip_path, dest, None)
+        return
+    first_err = None
+    for enc in ('utf-8', 'gbk', 'cp437'):
+        try:
+            _safe_extract_zip(zip_path, dest, pwd.encode(enc))
+            return
+        except RuntimeError as e:
+            first_err = first_err or e
+            continue
+    raise RuntimeError(first_err or '密码错误')
 
 
 def _extract_js_from_zip(data, cap=20 * 1024 * 1024):
@@ -1185,30 +1215,41 @@ class BaseApp:
 
     def do_update_subscription(self, sub):
         def work():
-            return fetch_latest_release(*sub['repo'].split('/'))
+            rel = fetch_latest_release(*sub['repo'].split('/'))
+            tag = rel.get('tag_name', '')
+            if tag and tag == sub.get('last_tag'):
+                return ('skip', rel, None, None)
+            assets = source_assets_of(rel)
+            if not assets:
+                return ('noasset', rel, None, None)
+            subdir = self._sub_download_dir(sub)
+            if self.settings.get('keep_history') and sub.get('last_tag'):
+                self._archive_previous(subdir, sub['last_tag'])
+            items = []
+            for a in assets:
+                target = self._download_asset_file(a, subdir)
+                items.append((target, a.get('name', 'asset')))
+            return ('new', rel, subdir, items)
 
         def done(ok, payload):
             if not ok:
                 self.log('「{}」更新失败：{}'.format(sub['repo'], payload), 'error')
                 self._view_refresh_subscriptions()
                 return
-            rel = payload
+            kind, rel, subdir, items = payload
             tag = rel.get('tag_name', '')
-            if tag and tag == sub.get('last_tag'):
+            if kind == 'skip':
                 self.log('「{}」已是最新版本 {}，无需更新'.format(sub['repo'], tag), 'ok')
                 self._view_refresh_subscriptions()
                 return
-            assets = source_assets_of(rel)
-            if not assets:
+            if kind == 'noasset':
                 self.log('「{}」v{} 没有 .js / .zip 附件，跳过'.format(sub['repo'], tag), 'warn')
                 return
             try:
-                subdir = self._sub_download_dir(sub)
-                if self.settings.get('keep_history') and sub.get('last_tag'):
-                    self._archive_previous(subdir, sub['last_tag'])
                 scripts = []
-                for a in assets:
-                    scripts.extend(self._asset_to_scripts(a, 'github:{}#{}'.format(sub['repo'], tag), subdir))
+                for target, name in items:
+                    scripts.extend(self._extract_asset_main(target, name,
+                                                            'github:{}#{}'.format(sub['repo'], tag), subdir))
                 if not self._auto_backup():
                     return
                 report = apply_imports(self.entries, scripts, 'update')
@@ -1258,10 +1299,11 @@ class BaseApp:
                     subdir = self._sub_download_dir(sub)
                     if self.settings.get('keep_history') and sub.get('last_tag'):
                         self._archive_previous(subdir, sub['last_tag'])
-                    scripts = []
+                    items = []
                     for a in assets:
-                        scripts.extend(self._asset_to_scripts(a, 'github:{}#{}'.format(sub['repo'], tag), subdir))
-                    out.append((sub, 'new', tag, scripts))
+                        target = self._download_asset_file(a, subdir)
+                        items.append((target, a.get('name', 'asset')))
+                    out.append((sub, 'new', tag, subdir, items))
                 except Exception as e:
                     out.append((sub, 'err', str(e)))
             return out
@@ -1282,8 +1324,16 @@ class BaseApp:
                 elif kind == 'err':
                     self.log('「{}」检查失败：{}'.format(sub['repo'], item[2]), 'error')
                 else:
-                    tag, scripts = item[2], item[3]
+                    tag, subdir, items = item[2], item[3], item[4]
                     self.log('「{}」发现新版本 {}，正在导入…'.format(sub['repo'], tag), 'info')
+                    try:
+                        scripts = []
+                        for target, name in items:
+                            scripts.extend(self._extract_asset_main(target, name,
+                                                                    'github:{}#{}'.format(sub['repo'], tag), subdir))
+                    except Exception as e:
+                        self.log('「{}」解压/解析失败：{}'.format(sub['repo'], e), 'error')
+                        continue
                     report = apply_imports(self.entries, scripts, 'update')
                     for s, old_v, new_v in report['updated']:
                         self.log('更新：{}  v{} → v{}'.format(s.name, old_v, new_v), 'update')
@@ -1432,17 +1482,51 @@ class BaseApp:
                 f.write(data)
         return target
 
-    def _asset_to_scripts(self, asset, src_label, subdir):
-        """下载附件（内置或 IDM）→ 保存/解压到订阅目录 → 解析全部脚本。"""
-        name = asset.get('name', 'asset')
-        target = self._download_asset_file(asset, subdir)
+    def _unzip_with_password(self, target, dest, name):
+        # 解压已下载的 zip；加密时弹窗询问密码（仅主线程调用，可弹对话框）
+        key = os.path.abspath(target)
+        try:
+            with zipfile.ZipFile(target) as zf:
+                encrypted = any((info.flag_bits & 0x1) for info in zf.infolist())
+        except Exception as e:
+            raise ValueError('无法读取压缩包：{}'.format(e))
+        if not encrypted:
+            _try_zip_password(target, dest, None)
+            return
+        pwd = _ZIP_PASSWORDS.get(key)
+        tried = 0
+        while True:
+            try:
+                _try_zip_password(target, dest, pwd)
+                if pwd:
+                    _ZIP_PASSWORDS[key] = pwd
+                return
+            except RuntimeError:
+                tried += 1
+                if tried >= 5:
+                    raise ValueError('多次密码错误，已放弃解压「{}」'.format(name))
+                if pwd is None:
+                    msg = '压缩包「{}」已加密，请输入解压密码：'.format(name)
+                else:
+                    msg = '解压密码不正确，请重新输入（取消则跳过）：'
+                pwd = self._view_input('压缩包需要密码', msg, password=True)
+                if not pwd:
+                    raise ValueError('已取消解压加密压缩包「{}」'.format(name))
+
+    def _extract_asset_main(self, target, name, src_label, subdir):
+        # 主线程处理已下载附件：解压（支持加密询问）→ 删除原压缩包 → 解析脚本
         if name.lower().endswith('.zip'):
             try:
-                _safe_extract_zip(target, subdir)
+                self._unzip_with_password(target, subdir, name)
             except Exception as e:
                 raise ValueError('解压失败：{}'.format(e))
+            try:
+                os.remove(target)
+            except OSError:
+                pass
             items = []
-            for root2, _dirs, files2 in os.walk(subdir):
+            for root2, dirs2, files2 in os.walk(subdir):
+                dirs2[:] = [d for d in dirs2 if d != 'history']
                 for fn in files2:
                     if fn.lower().endswith('.js'):
                         items.append(os.path.join(root2, fn))
@@ -1675,7 +1759,7 @@ class BaseApp:
     def _view_refresh_cfg_logwin(self):
         pass
 
-    def _view_input(self, title, prompt):
+    def _view_input(self, title, prompt, password=False):
         raise NotImplementedError
 
     def _view_confirm(self, title, message, danger=False):
@@ -2342,7 +2426,7 @@ class CtkApp(BaseApp):
         for i, sub in enumerate(self.subscriptions):
             self._build_sub_row(i, sub)
 
-    def _view_input(self, title, prompt):
+    def _view_input(self, title, prompt, password=False):
         ctk, C = self.ctk, self.C
         dlg = ctk.CTkToplevel(self.root)
         dlg.title(title)
@@ -2353,7 +2437,8 @@ class CtkApp(BaseApp):
         ctk.CTkLabel(dlg, text=prompt, wraplength=400, justify='left', font=self.f_base,
                      text_color=C['text']).pack(padx=22, pady=(18, 10), anchor='w')
         entry = ctk.CTkEntry(dlg, width=380, height=32, corner_radius=6, fg_color=C['field'],
-                             border_color=C['border'], text_color=C['text'], font=self.f_small)
+                             border_color=C['border'], text_color=C['text'], font=self.f_small,
+                             show='*' if password else '')
         entry.pack(padx=22, pady=(0, 12))
         btns = ctk.CTkFrame(dlg, fg_color='transparent')
         btns.pack(pady=(0, 16))
@@ -3323,7 +3408,7 @@ class TtkApp(BaseApp):
         except Exception:
             pass
 
-    def _view_input(self, title, prompt):
+    def _view_input(self, title, prompt, password=False):
         dlg = tk.Toplevel(self.root)
         dlg.title(title)
         dlg.configure(bg=self.C['card'])
@@ -3331,7 +3416,7 @@ class TtkApp(BaseApp):
         tk.Label(dlg, text=prompt, bg=self.C['card'], fg=self.C['text'], wraplength=400, justify='left',
                  font=(FONT_FAMILY, 10)).pack(padx=20, pady=(16, 10), anchor='w')
         var = tk.StringVar()
-        e = ttk.Entry(dlg, textvariable=var)
+        e = ttk.Entry(dlg, textvariable=var, show='*' if password else '')
         e.pack(padx=20, pady=(0, 12), fill='x')
         result = {'val': None}
 
@@ -3558,6 +3643,21 @@ def run_selftest(force_ttk=False):
                     app.root.update_idletasks()
                     assert len(app.candidates) == 1 and app.candidates[0].name == '订阅源'
                     app.candidates = []
+                    # 解压后自动删除原压缩包
+                    zbuf = io.BytesIO()
+                    with zipfile.ZipFile(zbuf, 'w') as z:
+                        z.writestr('pkg/a.js', '/*!\n * @name 解压源\n * @version 1.0\n */\n;(function(){})()')
+                    zdir = os.path.join(tmp, 'ztest')
+                    os.makedirs(zdir, exist_ok=True)
+                    zpath = os.path.join(zdir, 'bundle.zip')
+                    with open(zpath, 'wb') as f:
+                        f.write(zbuf.getvalue())
+                    app.settings['download_dir'] = os.path.join(tmp, 'dz')
+                    sub2 = {'repo': 'z/z', 'last_tag': 'v1'}
+                    scripts2 = app._extract_asset_main(zpath, 'bundle.zip', 'test', app._sub_download_dir(sub2))
+                    assert len(scripts2) == 1 and scripts2[0].name == '解压源'
+                    assert not os.path.exists(zpath), '解压后应删除原压缩包'
+                    assert os.path.isfile(os.path.join(app._sub_download_dir(sub2), 'pkg', 'a.js'))
                     app.do_scan_folder(src)
                     app.root.update_idletasks()
                     assert len(app.candidates) == 3
