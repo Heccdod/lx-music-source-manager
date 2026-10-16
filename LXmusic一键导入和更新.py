@@ -163,6 +163,17 @@ def short(text, n):
     return text if len(text) <= n else text[:n - 1] + '…'
 
 
+def short_path(path, limit=52):
+    """路径过长时中间省略，保留盘符与文件名。"""
+    path = path or ''
+    if len(path) <= limit:
+        return path
+    head_len = max(12, limit // 2 - 2)
+    head = path[:head_len]
+    tail = path[-(limit - head_len - 3):]
+    return head + '...' + tail
+
+
 def normalize_name(name):
     return (name or '').strip().casefold()
 
@@ -1012,7 +1023,7 @@ class BaseApp:
             tip = '（{} 个缺少脚本内容）'.format(n_bad) if n_bad else ''
             self.log('已加载 {} 个已导入音源{}'.format(len(self.entries), tip), 'ok')
         if self.path_label is not None:
-            self.path_label.configure(text=short('数据文件：' + (self.user_api_path or '未定位'), 88))
+            self.path_label.configure(text='数据文件：' + (short_path(self.user_api_path, 48) or '未定位'))
         self._view_refresh_imported()
         self._view_status()
 
@@ -1024,7 +1035,8 @@ class BaseApp:
             w = '目录可写' if os.access(os.path.dirname(p), os.W_OK) else '目录不可写'
         else:
             w = '未定位'
-        self._view_set_status('数据文件：{}  [{}]    备份目录：{}    修改后需重启 LX Music 生效'.format(p or '(未定位)', w, self.backup_dir))
+        self._view_set_status('数据文件：{}  [{}]    备份目录：{}    修改后需重启 LX Music 生效'.format(
+            short_path(p, 46) or '(未定位)', w, short_path(self.backup_dir, 36)))
 
     def _auto_backup(self):
         if not self.settings.get('backup_enabled', True):
@@ -1705,6 +1717,73 @@ class BaseApp:
         """给设置页显示下载器探测结果。"""
         return 'IDM {} · ABDM {}'.format(
             '✓' if self.idm_path else '✗', '✓' if self.abdm_path else '✗')
+
+    # ---------------- 列表行文案（名称左、次要信息右，视觉更干净、控件更少） ----------------
+    def _cand_meta_text(self, s):
+        parts = ['v' + (s.version or '?')]
+        if s.author:
+            parts.append(short(s.author, 14))
+        parts.append(short(s.rel_path, 26))
+        return '  ·  '.join(parts)
+
+    def _imp_meta_text(self, e):
+        parts = ['v' + str(e.get('version') or '?')]
+        if e.get('author'):
+            parts.append(short(e['author'], 14))
+        if e.get('description'):
+            parts.append(short(e['description'], 30))
+        return '  ·  '.join(parts)
+
+    def _sub_meta_text(self, sub):
+        parts = []
+        if (sub.get('source') or 'release') == 'repo':
+            parts.append('目录' + ('/' + sub['path'] if sub.get('path') else ''))
+        tag = sub.get('last_tag')
+        parts.append(('当前 ' + tag) if tag else '未导入')
+        return '  ·  '.join(parts)
+
+    # ---------------- 界面共用的少量逻辑（两套 UI 完全一致，放在基类避免重复） ----------------
+    def do_clear_log(self):
+        self.logbox.configure(state='normal')
+        self.logbox.delete('1.0', 'end')
+        self.logbox.configure(state='disabled')
+
+    def _pick_dir_to(self, entry, cb):
+        d = filedialog.askdirectory(parent=self.root, title='选择文件夹',
+                                    initialdir=entry.get() or self.last_folder)
+        if d:
+            entry.delete(0, 'end')
+            entry.insert(0, d)
+            cb(d)
+
+    def _on_settings_close(self):
+        try:
+            self._settings_win.destroy()
+        except Exception:
+            pass
+        self._settings_win = None
+
+    def _cfg_selected_sub(self, what):
+        sel = self.cfg_sublist.curselection()
+        if not sel:
+            self._info('提示', '请先选择要{}的订阅'.format(what))
+            return None
+        return next((s for s in self.subscriptions if s.get('repo') == self.cfg_sublist.get(sel[0])), None)
+
+    def _open_cfg_sub_dir(self):
+        sub = self._cfg_selected_sub('打开')
+        if sub:
+            self.do_open_download_dir(sub)
+
+    def _delete_cfg_sub(self):
+        sel = self.cfg_sublist.curselection()
+        sub = self._cfg_selected_sub('删除')
+        if sub:
+            self.do_delete_subscription(sub)
+            try:
+                self.cfg_sublist.delete(sel[0])
+            except Exception:
+                pass
 
     def do_toggle_idm(self, want):
         # 兼容旧的 IDM 开关：映射为下载方式
@@ -2586,12 +2665,6 @@ class CtkApp(BaseApp):
         self._build()
         super().__init__(user_api_path=user_api_path, backup_dir=backup_dir, auto_confirm=auto_confirm)
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
-        if self.animations:
-            try:
-                self.root.attributes('-alpha', 0.0)
-            except Exception:
-                pass
-            self._fade_in(self.root)
 
     # ---------------- 构建 ----------------
     def _btn(self, master, text, command, kind='ghost', width=None):
@@ -2607,14 +2680,14 @@ class CtkApp(BaseApp):
 
     def _build(self):
         ctk, C = self.ctk, self.C
-        self.f_title = ctk.CTkFont(family=FONT_FAMILY, size=19, weight='bold')
-        self.f_card = ctk.CTkFont(family=FONT_FAMILY, size=15, weight='bold')
-        self.f_base = ctk.CTkFont(family=FONT_FAMILY, size=14)
-        self.f_bold = ctk.CTkFont(family=FONT_FAMILY, size=14, weight='bold')
-        self.f_small = ctk.CTkFont(family=FONT_FAMILY, size=13)
-        self.f_tiny = ctk.CTkFont(family=FONT_FAMILY, size=12)
-        self.f_btn = ctk.CTkFont(family=FONT_FAMILY, size=14)
-        self.f_log = ctk.CTkFont(family=FONT_FAMILY, size=13)
+        self.f_title = ctk.CTkFont(family=FONT_FAMILY, size=17, weight='bold')
+        self.f_card = ctk.CTkFont(family=FONT_FAMILY, size=14, weight='bold')
+        self.f_base = ctk.CTkFont(family=FONT_FAMILY, size=13)
+        self.f_bold = ctk.CTkFont(family=FONT_FAMILY, size=13, weight='bold')
+        self.f_small = ctk.CTkFont(family=FONT_FAMILY, size=12)
+        self.f_tiny = ctk.CTkFont(family=FONT_FAMILY, size=11)
+        self.f_btn = ctk.CTkFont(family=FONT_FAMILY, size=13)
+        self.f_log = ctk.CTkFont(family=FONT_FAMILY, size=12)
 
         self.root.grid_rowconfigure(1, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
@@ -2690,9 +2763,11 @@ class CtkApp(BaseApp):
 
         self.search_var = tk.StringVar()
         self.search_var.trace_add('write', lambda *a: self._on_search())
-        ctk.CTkEntry(card, textvariable=self.search_var, placeholder_text='搜索音源名称 / 版本 / 作者 / 路径…',
+        ctk.CTkEntry(card, textvariable=self.search_var,
+                     placeholder_text='搜索音源名称 / 作者 / 路径…',
+                     placeholder_text_color=C['muted'],
                      height=30, corner_radius=6, fg_color=C['field'], border_color=C['border'], border_width=1,
-                     text_color=C['text'], placeholder_text_color=C['faint'], font=self.f_small).grid(
+                     text_color=C['text'], font=self.f_small).grid(
             row=2, column=0, sticky='ew', padx=14, pady=(2, 4))
 
         # 隔离容器：CTk 滚动条默认请求高度 200px，会撑破布局，用固定容器隔绝其影响
@@ -2741,14 +2816,6 @@ class CtkApp(BaseApp):
         self.imp_count = ctk.CTkLabel(head, text='', font=self.f_small, text_color=C['muted'])
         self.imp_count.grid(row=0, column=1, sticky='e', padx=(0, 8))
         self._btn(head, '刷新', self._view_refresh_imported, width=62).grid(row=0, column=2, sticky='e')
-
-        cols = ctk.CTkFrame(card, fg_color='transparent')
-        cols.grid(row=1, column=0, sticky='ew', padx=18, pady=(4, 2))
-        cols.grid_columnconfigure(3, weight=1)
-        ctk.CTkLabel(cols, text='名称', font=self.f_tiny, text_color=C['faint']).grid(row=0, column=0, sticky='w', padx=(14, 8))
-        ctk.CTkLabel(cols, text='版本', font=self.f_tiny, text_color=C['faint']).grid(row=0, column=1, sticky='w', padx=(0, 8))
-        ctk.CTkLabel(cols, text='作者', font=self.f_tiny, text_color=C['faint']).grid(row=0, column=2, sticky='w', padx=(0, 8))
-        ctk.CTkLabel(cols, text='描述', font=self.f_tiny, text_color=C['faint']).grid(row=0, column=3, sticky='w')
 
         _imp_holder = tk.Frame(card, bg=C['card'])
         _imp_holder.grid_propagate(False)
@@ -2865,11 +2932,6 @@ class CtkApp(BaseApp):
         for tag, color in LOG_COLORS.items():
             self.logbox.tag_config(tag, foreground=color)
 
-    def do_clear_log(self):
-        self.logbox.configure(state='normal')
-        self.logbox.delete('1.0', 'end')
-        self.logbox.configure(state='disabled')
-
     # ---------------- 动画 ----------------
     def _set_row_color(self, widget, color):
         """立即设置行背景并同步子组件（悬停反馈无动画，进出必然复位，不残留）。"""
@@ -2887,15 +2949,6 @@ class CtkApp(BaseApp):
         except Exception:
             pass
 
-    def _fade_in(self, win, step=0, steps=9, interval=22):
-        """窗口 / 对话框淡入。"""
-        try:
-            win.attributes('-alpha', min(1.0, (step + 1) / steps))
-            if step + 1 < steps:
-                win.after(interval, lambda: self._fade_in(win, step + 1, steps, interval))
-        except Exception:
-            pass
-
     # ---------------- 候选行 ----------------
     def _build_candidate_row(self, i):
         # 行使用原生 tk 组件（无画布绘制层），滚动不产生拖尾；无勾选框，纯底色表达选中态
@@ -2903,22 +2956,15 @@ class CtkApp(BaseApp):
         s = self.candidates[i]
         row_bg = C['card2'] if i in self.checked_candidates else C['card']
         row = tk.Frame(self.cand_list, bg=row_bg, cursor='hand2')
-        row.pack(fill='x', padx=4, pady=3)
-        name = tk.Label(row, text=short(s.name, 22), bg=row_bg, fg=C['text'], font=self.f_bold,
+        row.pack(fill='x', padx=6, pady=1)
+        name = tk.Label(row, text=short(s.name, 24), bg=row_bg, fg=C['text'], font=self.f_bold,
                         anchor='w', cursor='hand2')
-        name.grid(row=0, column=0, sticky='w', padx=(14, 6), pady=9)
-        ver = tk.Label(row, text=short('v' + s.version, 14), bg=row_bg, fg=C['accent'], font=self.f_tiny,
-                       anchor='w', cursor='hand2')
-        ver.grid(row=0, column=1, sticky='w', padx=(0, 6), pady=9)
-        aut = tk.Label(row, text=short(s.author or '—', 14), bg=row_bg, fg=C['muted'], font=self.f_small,
-                       anchor='w', cursor='hand2')
-        aut.grid(row=0, column=2, sticky='w', padx=(0, 6), pady=9)
-        pat = tk.Label(row, text=s.rel_path, bg=row_bg, fg=C['faint'], font=self.f_tiny,
-                       anchor='w', cursor='hand2')
-        pat.grid(row=0, column=3, sticky='ew', padx=(0, 10), pady=9)
-        row.grid_columnconfigure(3, weight=1)
+        name.pack(side='left', padx=(10, 8), pady=4)
+        meta = tk.Label(row, text=self._cand_meta_text(s), bg=row_bg, fg=C['muted'], font=self.f_tiny,
+                        anchor='e', cursor='hand2')
+        meta.pack(side='right', padx=(8, 10), pady=4)
         self.cand_rows[i] = row
-        for w in (row, name, ver, aut, pat):
+        for w in (row, name, meta):
             w.bind('<Button-1>', lambda e, idx=i: self._cand_toggle(idx))
             w.bind('<Enter>', lambda e, idx=i, frm=row: self._row_enter(frm, idx))
             w.bind('<Leave>', lambda e, idx=i, frm=row: self._row_leave(frm, idx))
@@ -2959,22 +3005,15 @@ class CtkApp(BaseApp):
         C = self.C
         row_bg = C['card2'] if i in self.checked_imported else C['card']
         row = tk.Frame(self.imp_list, bg=row_bg, cursor='hand2')
-        row.pack(fill='x', padx=4, pady=3)
-        name = tk.Label(row, text=short(e.get('name', ''), 20), bg=row_bg, fg=C['text'], font=self.f_bold,
+        row.pack(fill='x', padx=6, pady=1)
+        name = tk.Label(row, text=short(e.get('name', ''), 24), bg=row_bg, fg=C['text'], font=self.f_bold,
                         anchor='w', cursor='hand2')
-        name.grid(row=0, column=0, sticky='w', padx=(14, 8), pady=8)
-        ver = tk.Label(row, text=short(str(e.get('version', '')), 12), bg=row_bg, fg=C['accent'], font=self.f_tiny,
-                       anchor='w', cursor='hand2')
-        ver.grid(row=0, column=1, sticky='w', padx=(0, 8), pady=8)
-        aut = tk.Label(row, text=short(e.get('author') or '—', 12), bg=row_bg, fg=C['muted'], font=self.f_small,
-                       anchor='w', cursor='hand2')
-        aut.grid(row=0, column=2, sticky='w', padx=(0, 8), pady=8)
-        des = tk.Label(row, text=short(e.get('description') or '', 34), bg=row_bg, fg=C['faint'], font=self.f_small,
-                       anchor='w', cursor='hand2')
-        des.grid(row=0, column=3, sticky='ew', padx=(0, 10), pady=8)
-        row.grid_columnconfigure(3, weight=1)
+        name.pack(side='left', padx=(10, 8), pady=4)
+        meta = tk.Label(row, text=self._imp_meta_text(e), bg=row_bg, fg=C['muted'], font=self.f_tiny,
+                        anchor='e', cursor='hand2')
+        meta.pack(side='right', padx=(8, 10), pady=4)
         self.imp_rows[i] = row
-        for w in (row, name, ver, aut, des):
+        for w in (row, name, meta):
             w.bind('<Button-1>', lambda ev, idx=i: self._imp_toggle(idx))
             w.bind('<Enter>', lambda ev, idx=i, frm=row: self._imp_enter(frm, idx))
             w.bind('<Leave>', lambda ev, idx=i, frm=row: self._imp_leave(frm, idx))
@@ -3080,20 +3119,16 @@ class CtkApp(BaseApp):
         is_current = sub.get('repo') == self._current_sub
         row_bg = C['card2'] if is_current else C['card']
         row = tk.Frame(self.sub_list, bg=row_bg, cursor='hand2')
-        row.pack(fill='x', padx=4, pady=2)
-        name_l = tk.Label(row, text=short(sub.get('repo', ''), 24), bg=row_bg, fg=C['text'],
-                          font=self.f_small, anchor='w', cursor='hand2')
-        name_l.pack(side='left', padx=(14, 6), pady=5)
-        if (sub.get('source') or 'release') == 'repo':
-            src_l = tk.Label(row, text='目录' + ('/' + sub['path'] if sub.get('path') else ''),
-                             bg=row_bg, fg=C['warn'], font=self.f_tiny, cursor='hand2')
-            src_l.pack(side='left', padx=(0, 6), pady=5)
+        row.pack(fill='x', padx=6, pady=1)
+        name_l = tk.Label(row, text=short(sub.get('repo', ''), 26), bg=row_bg, fg=C['text'],
+                          font=self.f_bold, anchor='w', cursor='hand2')
+        name_l.pack(side='left', padx=(10, 8), pady=4)
         tag = sub.get('last_tag')
-        st_l = tk.Label(row, text=('当前 ' + tag) if tag else '未导入', bg=row_bg,
+        st_l = tk.Label(row, text=self._sub_meta_text(sub), bg=row_bg,
                         fg=C['green'] if tag else C['faint'], font=self.f_tiny, cursor='hand2')
-        st_l.pack(side='right', padx=10, pady=5)
+        st_l.pack(side='right', padx=(8, 10), pady=4)
         self.sub_rows[i] = row
-        for w in [row, name_l, st_l] + ([src_l] if (sub.get('source') or 'release') == 'repo' else []):
+        for w in (row, name_l, st_l):
             w.bind('<Button-1>', lambda e, s=sub: self.do_show_subscription_sources(s))
             w.bind('<Double-Button-1>', lambda e, s=sub: self.do_update_subscription(s))
             w.bind('<Enter>', lambda e, frm=row, cur=is_current: self._sub_enter(frm, cur))
@@ -3192,43 +3227,6 @@ class CtkApp(BaseApp):
                 self.cfg_dl_status.configure(text=self._downloader_status_text())
         except Exception:
             pass
-
-    def _pick_dir_to(self, entry, cb):
-        d = filedialog.askdirectory(parent=self.root, title='选择文件夹',
-                                    initialdir=entry.get() or self.last_folder)
-        if d:
-            entry.delete(0, 'end')
-            entry.insert(0, d)
-            cb(d)
-
-    def _on_settings_close(self):
-        try:
-            self._settings_win.destroy()
-        except Exception:
-            pass
-        self._settings_win = None
-
-    def _open_cfg_sub_dir(self):
-        sel = self.cfg_sublist.curselection()
-        if not sel:
-            self._info('提示', '请先选择要打开的订阅')
-            return
-        sub = next((s for s in self.subscriptions if s.get('repo') == self.cfg_sublist.get(sel[0])), None)
-        if sub:
-            self.do_open_download_dir(sub)
-
-    def _delete_cfg_sub(self):
-        sel = self.cfg_sublist.curselection()
-        if not sel:
-            self._info('提示', '请先选择要删除的订阅')
-            return
-        sub = next((s for s in self.subscriptions if s.get('repo') == self.cfg_sublist.get(sel[0])), None)
-        if sub:
-            self.do_delete_subscription(sub)
-            try:
-                self.cfg_sublist.delete(sel[0])
-            except Exception:
-                pass
 
     def do_open_settings(self):
         ctk, C = self.ctk, self.C
@@ -3359,12 +3357,6 @@ class CtkApp(BaseApp):
             win.geometry('{}x{}+{}+{}'.format(w, h, x, y))
         except Exception:
             pass
-        if self.animations:
-            try:
-                win.attributes('-alpha', 0.0)
-            except Exception:
-                pass
-            self._fade_in(win, steps=6, interval=18)
 
     def _view_rebalance_bottom(self):
         # 隐藏某个底部模块时重排网格，让剩余卡片自动瓜分全部宽度
@@ -3467,16 +3459,6 @@ class CtkApp(BaseApp):
             dlg.geometry('{}x{}+{}+{}'.format(w, h, x, y))
         except Exception:
             pass
-        if self.animations:
-            try:
-                dlg.attributes('-alpha', 0.0)
-            except Exception:
-                pass
-            self._fade_in(dlg, steps=6, interval=18)
-            try:
-                dlg.after(400, lambda: dlg.attributes('-alpha', 1.0))
-            except Exception:
-                pass
         dlg.wait_window()
         return result['ok']
 
@@ -3505,13 +3487,6 @@ class CtkApp(BaseApp):
             dlg.after(10, lambda: dlg.iconphoto(False, self.icon))
         except Exception:
             pass
-        if self.animations:
-            try:
-                dlg.attributes('-alpha', 0.0)
-            except Exception:
-                pass
-            self._fade_in(dlg, steps=6, interval=18)
-
     def _view_ask_folder(self):
         return filedialog.askdirectory(title='选择包含音源脚本的文件夹（将遍历所有子文件夹）',
                                        parent=self.root, initialdir=self.last_folder)
@@ -3552,20 +3527,6 @@ class TtkApp(BaseApp):
         self._build()
         super().__init__(user_api_path=user_api_path, backup_dir=backup_dir, auto_confirm=auto_confirm)
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
-        if self.animations:
-            try:
-                self.root.attributes('-alpha', 0.0)
-            except Exception:
-                pass
-            self._fade_in_root()
-
-    def _fade_in_root(self, step=0):
-        try:
-            self.root.attributes('-alpha', min(1.0, (step + 1) / 9))
-            if step + 1 < 9:
-                self.root.after(22, lambda: self._fade_in_root(step + 1))
-        except Exception:
-            pass
 
     def _init_style(self):
         C = self.C
@@ -3649,12 +3610,12 @@ class TtkApp(BaseApp):
         self.search_var = tk.StringVar()
         self.search_var.trace_add('write', lambda *a: self._on_search())
         ttk.Entry(left, textvariable=self.search_var).grid(row=2, column=0, columnspan=2, sticky='ew', pady=(2, 4))
-        self.cand_tree = ttk.Treeview(left, columns=('chk', 'name', 'ver', 'author', 'path'), show='headings',
+        self.cand_tree = ttk.Treeview(left, columns=('chk', 'name', 'meta'), show='headings',
                                       selectmode='none')
-        for col, txt, width, anchor in (('chk', '选', 36, 'center'), ('name', '音源名称', 180, 'w'),
-                                        ('ver', '版本', 80, 'w'), ('author', '作者', 140, 'w'), ('path', '文件路径', 240, 'w')):
+        for col, txt, width, anchor in (('chk', '选', 36, 'center'), ('name', '音源名称', 210, 'w'),
+                                        ('meta', '版本 · 作者 · 路径', 430, 'w')):
             self.cand_tree.heading(col, text=txt)
-            self.cand_tree.column(col, width=width, anchor=anchor, stretch=(col == 'path'))
+            self.cand_tree.column(col, width=width, anchor=anchor, stretch=(col == 'meta'))
         self.cand_tree.tag_configure('checked', background=C['card2'], foreground=C['text'])
         self.cand_tree.grid(row=3, column=0, sticky='nsew', pady=2)
         self.cand_tree.bind('<Button-1>', self._on_cand_click)
@@ -3694,11 +3655,11 @@ class TtkApp(BaseApp):
         self.imp_count = ttk.Label(rhead, text='', style='Muted.TLabel')
         self.imp_count.grid(row=0, column=1, sticky='e', padx=(8, 6))
         ttk.Button(rhead, text='刷新', command=self._view_refresh_imported).grid(row=0, column=2, sticky='e')
-        self.imp_tree = ttk.Treeview(right, columns=('name', 'ver', 'author', 'desc'), show='headings',
+        self.imp_tree = ttk.Treeview(right, columns=('name', 'meta'), show='headings',
                                      selectmode='extended')
-        for col, txt, width in (('name', '名称', 160), ('ver', '版本', 90), ('author', '作者', 130), ('desc', '描述', 260)):
+        for col, txt, width in (('name', '名称', 210), ('meta', '版本 · 作者 · 描述', 430)):
             self.imp_tree.heading(col, text=txt)
-            self.imp_tree.column(col, width=width, anchor='w', stretch=(col == 'desc'))
+            self.imp_tree.column(col, width=width, anchor='w', stretch=(col == 'meta'))
         self.imp_tree.grid(row=1, column=0, sticky='nsew', pady=(4, 2))
         self.imp_tree.bind('<<TreeviewSelect>>', self._on_imp_select)
         self.imp_tree.bind('<Double-1>', self._on_imp_double)
@@ -3756,7 +3717,7 @@ class TtkApp(BaseApp):
         ttk.Button(sbtns, text='打开目录', command=self.do_open_download_dir).pack(side='left', padx=2)
         self.sub_tree = ttk.Treeview(sub, columns=('repo', 'st'), show='headings', height=5, selectmode='extended')
         self.sub_tree.heading('repo', text='仓库')
-        self.sub_tree.heading('st', text='状态')
+        self.sub_tree.heading('st', text='来源 · 版本')
         self.sub_tree.column('repo', width=170, anchor='w')
         self.sub_tree.column('st', width=90, anchor='w')
         self.sub_tree.grid(row=1, column=0, sticky='ew', pady=(6, 0))
@@ -3813,11 +3774,6 @@ class TtkApp(BaseApp):
         ttk.Label(status, text='所有写操作前自动备份；修改后需重启 LX Music 生效',
                   style='Status.TLabel').grid(row=0, column=1, sticky='e')
 
-    def do_clear_log(self):
-        self.logbox.configure(state='normal')
-        self.logbox.delete('1.0', 'end')
-        self.logbox.configure(state='disabled')
-
     # ---------------- 事件 ----------------
     def _on_cand_click(self, event):
         row = self.cand_tree.identify_row(event.y)
@@ -3861,8 +3817,7 @@ class TtkApp(BaseApp):
             shown += 1
             chk = '☑' if i in self.checked_candidates else '☐'
             tree.insert('', 'end', iid=str(i),
-                        values=(chk, short(s.name, 18), short('v' + s.version, 12),
-                                short(s.author or '—', 12), s.rel_path),
+                        values=(chk, short(s.name, 20), self._cand_meta_text(s)),
                         tags=(('checked',) if i in self.checked_candidates else ()))
         self.cand_count.configure(text='共 {} 个 · 显示 {} · 已选 {}'.format(
             len(self.candidates), shown, len(self.checked_candidates)))
@@ -3873,8 +3828,7 @@ class TtkApp(BaseApp):
         tree.delete(*tree.get_children())
         for i, e in enumerate(self.entries):
             tree.insert('', 'end', iid=str(i),
-                        values=(short(e.get('name', ''), 18), short(str(e.get('version', '')), 12),
-                                short(e.get('author') or '—', 12), short(e.get('description') or '', 30)))
+                        values=(short(e.get('name', ''), 22), self._imp_meta_text(e)))
         self.checked_imported = {i for i in self.checked_imported if 0 <= i < len(self.entries)}
         for i in self.checked_imported:
             if tree.exists(str(i)):
@@ -3924,8 +3878,7 @@ class TtkApp(BaseApp):
         for i, sub in enumerate(self.subscriptions):
             tag = sub.get('last_tag')
             tree.insert('', 'end', iid=str(i),
-                        values=(short(sub.get('repo', '') + (' 「目录」' if (sub.get('source') or 'release') == 'repo' else ''), 26),
-                                ('当前 ' + tag) if tag else '未导入'),
+                        values=(short(sub.get('repo', ''), 28), self._sub_meta_text(sub)),
                         tags=('cur',) if sub.get('repo') == self._current_sub else ())
 
     def _view_apply_backup_visible(self):
@@ -3959,43 +3912,6 @@ class TtkApp(BaseApp):
                 self.cfg_dl_status.configure(text=self._downloader_status_text())
         except Exception:
             pass
-
-    def _pick_dir_to(self, entry, cb):
-        d = filedialog.askdirectory(parent=self.root, title='选择文件夹',
-                                    initialdir=entry.get() or self.last_folder)
-        if d:
-            entry.delete(0, 'end')
-            entry.insert(0, d)
-            cb(d)
-
-    def _on_settings_close(self):
-        try:
-            self._settings_win.destroy()
-        except Exception:
-            pass
-        self._settings_win = None
-
-    def _open_cfg_sub_dir(self):
-        sel = self.cfg_sublist.curselection()
-        if not sel:
-            self._info('提示', '请先选择要打开的订阅')
-            return
-        sub = next((s for s in self.subscriptions if s.get('repo') == self.cfg_sublist.get(sel[0])), None)
-        if sub:
-            self.do_open_download_dir(sub)
-
-    def _delete_cfg_sub(self):
-        sel = self.cfg_sublist.curselection()
-        if not sel:
-            self._info('提示', '请先选择要删除的订阅')
-            return
-        sub = next((s for s in self.subscriptions if s.get('repo') == self.cfg_sublist.get(sel[0])), None)
-        if sub:
-            self.do_delete_subscription(sub)
-            try:
-                self.cfg_sublist.delete(sel[0])
-            except Exception:
-                pass
 
     def do_open_settings(self):
         C = self.C
