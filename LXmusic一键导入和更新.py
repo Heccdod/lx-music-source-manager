@@ -587,6 +587,8 @@ def logs_path():
 
 DEFAULT_SETTINGS = {
     'mirror': '',
+    'downloader': 'auto',
+    'abdm_path': '',
     'use_idm': True,
     'backup_enabled': True,
     'backup_dir': '',
@@ -644,6 +646,12 @@ def load_settings():
     for k in DEFAULT_SETTINGS:
         if k in data and data[k] is not None:
             out[k] = data[k]
+    # 旧版本只有 use_idm 开关，迁移到新的「下载方式」设置
+    if 'downloader' not in data:
+        if 'use_idm' in data:
+            out['downloader'] = 'idm' if data.get('use_idm') else 'builtin'
+        else:
+            out['downloader'] = 'auto'
     return out
 
 
@@ -721,6 +729,102 @@ def find_idm_path():
 
 
 find_idm_path._cached = None
+
+
+def find_abdm_path():
+    """探测 AB Download Manager（ABDM）可执行文件，未安装返回 None（结果缓存）。
+    依次尝试：PATH 命令 → 注册表安装信息 → 常见安装目录 → 正在运行的进程。"""
+    if find_abdm_path._cached is not None:
+        return find_abdm_path._cached
+    found = None
+    # 优先命令行版本：只有 ABDownloadManagerCli.exe 才能接收 download 子命令
+    names = ('ABDownloadManagerCli.exe', 'ABDownloadManager.exe',
+             'ab-download-manager.exe', 'abdm.exe', 'AB Download Manager.exe')
+    for exe in ('abdm', 'ABDownloadManagerCli', 'ab-download-manager', 'ABDownloadManager'):
+        try:
+            p = shutil.which(exe)
+        except Exception:
+            p = None
+        if p and os.path.isfile(p):
+            found = p
+            break
+    if not found:
+        try:
+            import winreg
+            roots = [
+                (winreg.HKEY_CURRENT_USER, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
+                (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'),
+                (winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'),
+            ]
+            for root, sub in roots:
+                try:
+                    with winreg.OpenKey(root, sub) as k:
+                        count = winreg.QueryInfoKey(k)[0]
+                except OSError:
+                    continue
+                for i in range(count):
+                    try:
+                        with winreg.OpenKey(k, winreg.EnumKey(k, i)) as sk:
+                            try:
+                                dn = str(winreg.QueryValueEx(sk, 'DisplayName')[0]).lower()
+                            except OSError:
+                                continue
+                            if 'ab download manager' not in dn:
+                                continue
+                            for val in ('InstallLocation', 'DisplayIcon'):
+                                try:
+                                    v = str(winreg.QueryValueEx(sk, val)[0]).strip('"').split(',')[0].strip()
+                                except OSError:
+                                    continue
+                                cand = v if v.lower().endswith('.exe') else os.path.join(v, 'ABDownloadManagerCli.exe')
+                                if os.path.isfile(cand):
+                                    found = cand
+                                    break
+                    except OSError:
+                        continue
+                    if found:
+                        break
+                if found:
+                    break
+        except Exception:
+            pass
+    if not found:
+        bases = []
+        for env in ('LOCALAPPDATA', 'ProgramFiles', 'ProgramFiles(x86)'):
+            b = os.environ.get(env)
+            if b:
+                bases.append(b)
+                bases.append(os.path.join(b, 'Programs'))
+        for base in bases:
+            for sub in ('AB Download Manager', 'ab-download-manager', 'ABDownloadManager'):
+                for n in names:
+                    p = os.path.join(base, sub, n)
+                    if os.path.isfile(p):
+                        found = p
+                        break
+                if found:
+                    break
+            if found:
+                break
+    if not found:
+        try:
+            out = subprocess.run(
+                ['powershell', '-NoProfile', '-Command',
+                 "Get-Process | Where-Object { $_.ProcessName -like '*ab*download*' } | "
+                 "Select-Object -First 1 -ExpandProperty Path"],
+                capture_output=True, text=True, timeout=12)
+            for line in (out.stdout or '').splitlines():
+                line = line.strip()
+                if line and os.path.isfile(line):
+                    found = line
+                    break
+        except Exception:
+            pass
+    find_abdm_path._cached = found
+    return found
+
+
+find_abdm_path._cached = None
 
 
 def apply_imports(entries, sources, mode):
@@ -837,12 +941,16 @@ class BackupManager:
 
 # ---------------------------------------------------------------- 业务逻辑基类（与 UI 无关）
 class BaseApp:
+    # 订阅下载方式（界面下拉用的中文标签）
+    DL_LABELS = {'auto': '自动', 'builtin': '内置', 'idm': 'IDM', 'abdm': 'ABDM'}
+
     def __init__(self, user_api_path=None, backup_dir=None, auto_confirm=False):
         self.auto_confirm = auto_confirm
         self.settings = load_settings()
         set_mirror(self.settings['mirror'])
         self.use_idm = bool(self.settings['use_idm'])
         self.idm_path = find_idm_path()
+        self.abdm_path = self.settings.get('abdm_path') or find_abdm_path()
         self.user_api_path = user_api_path if user_api_path is not None else default_user_api_path()
         self.backup_dir = backup_dir if backup_dir is not None else effective_backup_dir(self.settings)
         self.backups = BackupManager(self.backup_dir)
@@ -1519,15 +1627,88 @@ class BaseApp:
         save_settings(self.settings)
         self.log('镜像已切换：{}'.format(value or '直连（官方 GitHub）'), 'ok')
 
-    def do_toggle_idm(self, want):
-        if want and not self.idm_path:
-            self._info('提示', '未检测到 IDM（Internet Download Manager），继续使用内置下载')
-            self.idm_var.set(False)
+    def do_set_downloader(self, mode):
+        """切换订阅下载方式：auto（自动）/ builtin（内置）/ idm / abdm。"""
+        mode = (mode or 'auto').lower()
+        if mode not in self.DL_LABELS:
+            mode = 'auto'
+        if mode == 'idm' and not self.idm_path:
+            self._info('提示', '未检测到 IDM（Internet Download Manager）')
+            self._view_refresh_settings_row()
             return
-        self.settings['use_idm'] = self.use_idm = bool(want)
+        if mode == 'abdm' and not self.abdm_path:
+            self._info('提示', '未检测到 AB Download Manager（ABDM）\n\n'
+                               '安装后重启本工具即可自动识别，也可在设置里手动指定程序路径。')
+            self._view_refresh_settings_row()
+            return
+        self.settings['downloader'] = mode
+        self.settings['use_idm'] = mode in ('idm', 'auto')
+        self.use_idm = self.settings['use_idm']
         save_settings(self.settings)
         self._view_refresh_settings_row()
-        self.log('订阅下载已切换为：{}'.format('IDM 下载' if self.use_idm else '内置下载'), 'ok')
+        self.log('下载方式已切换为：{}'.format(self.DL_LABELS.get(mode, mode)), 'ok')
+
+    def _on_downloader_pick(self, label):
+        mode = next((k for k, v in self.DL_LABELS.items() if v == label), 'auto')
+        self.do_set_downloader(mode)
+
+    def do_pick_abdm(self):
+        """手动指定 AB Download Manager 可执行文件（自动探测不到时使用）。"""
+        init = os.path.dirname(self.abdm_path) if self.abdm_path else ''
+        p = filedialog.askopenfilename(title='选择 AB Download Manager 的程序文件',
+                                       initialdir=init or None,
+                                       filetypes=[('可执行文件', '*.exe'), ('全部文件', '*.*')])
+        if not p:
+            return
+        self.settings['abdm_path'] = p
+        self.abdm_path = p
+        find_abdm_path._cached = p
+        save_settings(self.settings)
+        self._view_refresh_settings_row()
+        self.log('已指定 AB Download Manager：{}'.format(p), 'ok')
+
+    def do_test_abdm(self):
+        """测试 AB Download Manager 本地服务是否可用（端口 15151）。"""
+        if not self.abdm_path:
+            self._info('提示', '未检测到 AB Download Manager\n\n可在设置里手动指定其程序路径。')
+            return
+
+        def work():
+            try:
+                req = urllib.request.Request('http://127.0.0.1:15151/queues')
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+                return ('OK', data)
+            except Exception as e:
+                return ('ERR', str(e))
+
+        def done(ok, payload):
+            if not ok:
+                self.log('ABDM 测试失败：{}'.format(payload), 'error')
+                return
+            kind, data = payload
+            if kind == 'OK':
+                names = '、'.join(str(q.get('name')) for q in (data or [])) or '无'
+                self._info('AB Download Manager 服务正常',
+                           '本地服务（端口 15151）已响应。\n\n队列：{}\n\n'
+                           '若下载仍无反应，请在该软件「设置 → 集成」里检查浏览器集成是否已开启。'.format(names))
+                self.log('ABDM 本地服务正常，队列：{}'.format(names), 'ok')
+            else:
+                self._info('AB Download Manager 服务不可用',
+                           '无法连接本地服务（端口 15151）：\n\n{}\n\n'
+                           '请确认 AB Download Manager 正在运行；仍失败时会自动改用内置下载。'.format(data))
+                self.log('ABDM 本地服务不可用：{}'.format(data), 'error')
+
+        self._run_task(work, done, '正在测试 AB Download Manager…')
+
+    def _downloader_status_text(self):
+        """给设置页显示下载器探测结果。"""
+        return 'IDM {} · ABDM {}'.format(
+            '✓' if self.idm_path else '✗', '✓' if self.abdm_path else '✗')
+
+    def do_toggle_idm(self, want):
+        # 兼容旧的 IDM 开关：映射为下载方式
+        self.do_set_downloader('idm' if want else 'builtin')
 
     def _setup_placeholder(self, entry, text):
         """给输入框加灰色占位提示（例如 https://ghfast.top），兼容 tk/ttk 输入框。"""
@@ -1615,8 +1796,103 @@ class BaseApp:
             pass
         return moved
 
+    _DL_WAIT = 180
+
+    def _download_by_idm(self, url, target):
+        """调用 IDM 下载到 target，阻塞等待文件出现（超时抛错）。"""
+        folder = os.path.dirname(target) or '.'
+        name = os.path.basename(target)
+        os.makedirs(folder, exist_ok=True)
+        subprocess.Popen([self.idm_path, '/d', mirrored_url(url), '/p', folder, '/f', name, '/n', '/s'])
+        deadline = time.time() + self._DL_WAIT
+        while time.time() < deadline:
+            if os.path.isfile(target) and os.path.getsize(target) > 0:
+                return
+            time.sleep(2)
+        raise ValueError('等待 IDM 下载超时（{} 秒）'.format(self._DL_WAIT))
+
+    def _download_by_abdm(self, url, target):
+        """用 AB Download Manager 下载到 target：优先本地 REST 服务，失败再退回 CLI。
+        ABDM 可能按链接里的文件名保存，因此会识别目录中新出现的文件并改为目标名。"""
+        folder = os.path.dirname(target) or '.'
+        name = os.path.basename(target)
+        os.makedirs(folder, exist_ok=True)
+        try:
+            before = set(os.listdir(folder))
+        except OSError:
+            before = set()
+        m_url = mirrored_url(url)
+        started = False
+        try:
+            body = json.dumps({'downloadSource': {'link': m_url},
+                               'folder': folder.replace(chr(92), '/')}).encode('utf-8')
+            req = urllib.request.Request('http://127.0.0.1:15151/start-headless-download',
+                                         data=body, headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                resp.read()
+            started = True
+        except Exception:
+            started = False
+        if not started:
+            subprocess.Popen([self.abdm_path, 'download', 'add', 'http',
+                              '--link=' + m_url,
+                              '--folder=' + folder.replace(chr(92), '/'),
+                              '--name=' + name, '--start'])
+        deadline = time.time() + self._DL_WAIT
+        while time.time() < deadline:
+            if os.path.isfile(target) and os.path.getsize(target) > 0:
+                return
+            try:
+                new = [f for f in os.listdir(folder)
+                       if f not in before and not f.endswith(('.part', '.tmp', '.crdownload'))]
+            except OSError:
+                new = []
+            for f in new:
+                p = os.path.join(folder, f)
+                try:
+                    if os.path.isfile(p) and os.path.getsize(p) > 0:
+                        os.replace(p, target)
+                        return
+                except OSError:
+                    continue
+            time.sleep(2)
+        raise ValueError('等待 AB Download Manager 下载超时（{} 秒）'.format(self._DL_WAIT))
+
+    def _download_url_to(self, url, target):
+        """按设置的下载方式把 url 下载到 target，返回实际使用的下载器名。"""
+        mode = (self.settings.get('downloader') or 'auto').lower()
+        order = {'builtin': ['builtin'], 'idm': ['idm'], 'abdm': ['abdm'],
+                 'auto': ['idm', 'abdm', 'builtin']}.get(mode, ['builtin'])
+        for kind in order:
+            if kind == 'idm' and self.idm_path:
+                try:
+                    self._download_by_idm(url, target)
+                    return 'idm'
+                except FileNotFoundError:
+                    self.idm_path = None
+                except Exception:
+                    pass
+                continue
+            if kind == 'abdm' and self.abdm_path:
+                try:
+                    self._download_by_abdm(url, target)
+                    return 'abdm'
+                except FileNotFoundError:
+                    self.abdm_path = None
+                except Exception:
+                    pass
+                continue
+            if kind == 'builtin':
+                with open(target, 'wb') as f:
+                    f.write(download_bytes(url))
+                return 'builtin'
+        # 外部下载器都不可用/失败时用内置兜底
+        with open(target, 'wb') as f:
+            f.write(download_bytes(url))
+        return 'builtin'
+
     def _download_asset_file(self, asset, subdir):
-        """把附件下载到订阅目录并返回本地路径（优先 IDM，未装/失败则内置下载）。"""
+        """把附件下载到订阅目录并返回本地路径（按设置的下载方式）。"""
         name = asset.get('name', 'asset')
         os.makedirs(subdir, exist_ok=True)
         target = os.path.join(subdir, os.path.basename(name))
@@ -1625,26 +1901,7 @@ class BaseApp:
                 os.remove(target)
             except OSError:
                 pass
-        idm_ok = False
-        if self.use_idm and self.idm_path:
-            try:
-                url = mirrored_url(asset['browser_download_url'])
-                subprocess.Popen([self.idm_path, '/d', url, '/p', subdir, '/f', os.path.basename(name), '/n', '/s'])
-                deadline = time.time() + 600
-                while time.time() < deadline:
-                    if os.path.isfile(target) and os.path.getsize(target) > 0:
-                        idm_ok = True
-                        break
-                    time.sleep(2)
-                else:
-                    raise ValueError('等待 IDM 下载超时（10 分钟）：{}'.format(name))
-            except (FileNotFoundError, OSError):
-                # IDM 路径已失效，标记失效并回退内置下载
-                self.idm_path = None
-        if not idm_ok:
-            data = download_bytes(asset['browser_download_url'])
-            with open(target, 'wb') as f:
-                f.write(data)
+        self._download_url_to(asset['browser_download_url'], target)
         return target
 
     def _download_repo_file(self, repo, item, subdir):
@@ -2309,6 +2566,7 @@ class CtkApp(BaseApp):
         set_mirror(self.settings['mirror'])
         self.use_idm = self.settings['use_idm']
         self.idm_path = find_idm_path()
+        self.abdm_path = self.settings.get('abdm_path') or find_abdm_path()
         ctk.set_appearance_mode('light')
         ctk.set_default_color_theme('blue')
         self.root = ctk.CTk(fg_color=self.C['bg'])
@@ -2577,13 +2835,17 @@ class CtkApp(BaseApp):
             text_color=C['text'], dropdown_fg_color=C['card'], dropdown_hover_color=C['hover'],
             dropdown_text_color=C['text'], font=self.f_tiny)
         self.mirror_combo.pack(side='left', padx=6)
-        self.idm_var = tk.BooleanVar(value=bool(self.use_idm and self.idm_path))
-        self.idm_check = WebCheck(setrow, variable=self.idm_var,
-                                  command=lambda: self.do_toggle_idm(self.idm_var.get()))
-        self.idm_check.pack(side='left', padx=(10, 4), pady=5)
-        if not self.idm_path:
-            self.idm_check.set_state(False)
-        tk.Label(setrow, text='IDM 下载', bg=C['card'], fg=C['muted'], font=self.f_tiny).pack(side='left')
+        tk.Label(setrow, text='下载', bg=C['card'], fg=C['faint'], font=self.f_tiny).pack(side='left', padx=(10, 4))
+        self.dl_var = tk.StringVar(value=self.DL_LABELS.get(self.settings.get('downloader', 'auto'), '自动'))
+        self.dl_menu = ctk.CTkOptionMenu(setrow, values=list(self.DL_LABELS.values()),
+                                         variable=self.dl_var, width=104, height=26,
+                                         font=self.f_tiny, dropdown_font=self.f_tiny,
+                                         fg_color=C['field'], button_color=C['border'],
+                                         button_hover_color=C['hover'], text_color=C['text'],
+                                         dropdown_fg_color=C['card'], dropdown_hover_color=C['card2'],
+                                         dropdown_text_color=C['text'],
+                                         command=self._on_downloader_pick)
+        self.dl_menu.pack(side='left', padx=(0, 6), pady=5)
 
         lg = ctk.CTkFrame(bottom, fg_color=C['card'], corner_radius=8)
         lg.grid(row=0, column=2, sticky='nsew', padx=(6, 0))
@@ -2920,7 +3182,14 @@ class CtkApp(BaseApp):
 
     def _view_refresh_settings_row(self):
         try:
-            self.idm_var.set(bool(self.use_idm and self.idm_path))
+            self.dl_var.set(self.DL_LABELS.get(self.settings.get('downloader', 'auto'), '自动'))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'cfg_dl_var'):
+                self.cfg_dl_var.set(self.DL_LABELS.get(self.settings.get('downloader', 'auto'), '自动'))
+            if hasattr(self, 'cfg_dl_status'):
+                self.cfg_dl_status.configure(text=self._downloader_status_text())
         except Exception:
             pass
 
@@ -3028,12 +3297,25 @@ class CtkApp(BaseApp):
                                    self.do_set_download_dir)
         self._btn(f2, '浏览…', lambda: self._pick_dir_to(self.cfg_dl_entry, self.do_set_download_dir),
                   width=64).grid(row=1, column=2, padx=(0, 14), pady=4)
-        wsub(f2, 2, '每个订阅存放于 下载目录/<仓库名>/ 子文件夹；zip 附件自动解压')
-        self.cfg_idm_var = tk.BooleanVar(value=bool(self.use_idm and self.idm_path))
-        wcheck(f2, 3, self.cfg_idm_var, '使用 IDM 下载（检测到 IDM 时可用）',
-               lambda: self.do_toggle_idm(self.cfg_idm_var.get()))
-        self.cfg_hist_var = tk.BooleanVar(value=self.settings.get('keep_history', False))
-        wcheck(f2, 4, self.cfg_hist_var, '保存历史订阅（更新前归档旧版本到 history 子目录，默认关闭）',
+        wsub(f2, 2, '每个订阅存放于 下载目录/<仓库名>/ 子文件夹；zip 自动解压，旧版本归档到 history/')
+        wlab(f2, 3, '下载方式', 0)
+        self.cfg_dl_var = tk.StringVar(value=self.DL_LABELS.get(self.settings.get('downloader', 'auto'), '自动'))
+        self.cfg_dl_menu = ctk.CTkOptionMenu(f2, values=list(self.DL_LABELS.values()),
+                                             variable=self.cfg_dl_var, width=110, height=28,
+                                             font=self.f_small, dropdown_font=self.f_small,
+                                             fg_color=C['field'], button_color=C['border'],
+                                             button_hover_color=C['hover'], text_color=C['text'],
+                                             dropdown_fg_color=C['card'], dropdown_hover_color=C['card2'],
+                                             dropdown_text_color=C['text'],
+                                             command=self._on_downloader_pick)
+        self.cfg_dl_menu.grid(row=3, column=1, sticky='w', padx=(0, 8), pady=4)
+        self.cfg_dl_status = ctk.CTkLabel(f2, text=self._downloader_status_text(), font=self.f_tiny,
+                                          text_color=C['faint'], anchor='w')
+        self.cfg_dl_status.grid(row=3, column=2, sticky='w', padx=(0, 10), pady=4)
+        self._btn(f2, '测试 ABDM', self.do_test_abdm, width=84).grid(row=3, column=3, padx=(0, 8), pady=4)
+        self._btn(f2, '指定 ABDM…', self.do_pick_abdm, width=92).grid(row=3, column=4, padx=(0, 14), pady=4)
+        self.cfg_hist_var = tk.BooleanVar(value=self.settings.get('keep_history', True))
+        wcheck(f2, 4, self.cfg_hist_var, '保留历史版本（关闭后更新时直接清除旧版本）',
                lambda: self.do_set_keep_history(self.cfg_hist_var.get()))
         wlab(f2, 5, '已有订阅', 0)
         self.cfg_sublist = tk.Listbox(f2, height=3, bg=C['field'], fg=C['text'], relief='flat',
@@ -3251,6 +3533,7 @@ class TtkApp(BaseApp):
         set_mirror(self.settings['mirror'])
         self.use_idm = self.settings['use_idm']
         self.idm_path = find_idm_path()
+        self.abdm_path = self.settings.get('abdm_path') or find_abdm_path()
         self.root = tk.Tk()
         if hidden:
             self.root.withdraw()
@@ -3496,13 +3779,12 @@ class TtkApp(BaseApp):
                                          width=12, state='readonly')
         self.mirror_combo.bind('<<ComboboxSelected>>', lambda e: self._on_mirror_preset(self.mirror_combo.get()))
         self.mirror_combo.pack(side='left', padx=6)
-        self.idm_var = tk.BooleanVar(value=bool(self.use_idm and self.idm_path))
-        self.idm_check = WebCheck(setrow, variable=self.idm_var,
-                                  command=lambda: self.do_toggle_idm(self.idm_var.get()))
-        self.idm_check.pack(side='left', padx=(10, 4), pady=4)
-        if not self.idm_path:
-            self.idm_check.set_state(False)
-        ttk.Label(setrow, text='IDM 下载', style='Muted.TLabel').pack(side='left')
+        ttk.Label(setrow, text='下载', style='Muted.TLabel').pack(side='left', padx=(10, 4))
+        self.dl_var = tk.StringVar(value=self.DL_LABELS.get(self.settings.get('downloader', 'auto'), '自动'))
+        self.dl_box = ttk.Combobox(setrow, textvariable=self.dl_var, values=list(self.DL_LABELS.values()),
+                                   state='readonly', width=6)
+        self.dl_box.pack(side='left', padx=(0, 6))
+        self.dl_box.bind('<<ComboboxSelected>>', lambda e: self._on_downloader_pick(self.dl_var.get()))
 
         lg = ttk.Frame(bottom, style='Card.TFrame', padding=12)
         lg.grid(row=0, column=2, sticky='nsew', padx=(5, 0))
@@ -3667,7 +3949,14 @@ class TtkApp(BaseApp):
 
     def _view_refresh_settings_row(self):
         try:
-            self.idm_var.set(bool(self.use_idm and self.idm_path))
+            self.dl_var.set(self.DL_LABELS.get(self.settings.get('downloader', 'auto'), '自动'))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, 'cfg_dl_var'):
+                self.cfg_dl_var.set(self.DL_LABELS.get(self.settings.get('downloader', 'auto'), '自动'))
+            if hasattr(self, 'cfg_dl_status'):
+                self.cfg_dl_status.configure(text=self._downloader_status_text())
         except Exception:
             pass
 
@@ -3771,12 +4060,20 @@ class TtkApp(BaseApp):
         self.cfg_dl_entry = wentry(f2, 1, effective_download_dir(self.settings), self.do_set_download_dir)
         ttk.Button(f2, text='浏览…', command=lambda: self._pick_dir_to(self.cfg_dl_entry, self.do_set_download_dir)).grid(
             row=1, column=2, padx=(0, 14), pady=4)
-        wsub(f2, 2, '每个订阅存放于 下载目录/<仓库名>/ 子文件夹；zip 附件自动解压')
-        self.cfg_idm_var = tk.BooleanVar(value=bool(self.use_idm and self.idm_path))
-        wcheck(f2, 3, self.cfg_idm_var, '使用 IDM 下载（检测到 IDM 时可用）',
-               lambda: self.do_toggle_idm(self.cfg_idm_var.get()))
-        self.cfg_hist_var = tk.BooleanVar(value=self.settings.get('keep_history', False))
-        wcheck(f2, 4, self.cfg_hist_var, '保存历史订阅（更新前归档旧版本到 history 子目录，默认关闭）',
+        wsub(f2, 2, '每个订阅存放于 下载目录/<仓库名>/ 子文件夹；zip 自动解压，旧版本归档到 history/')
+        wlab(f2, 3, '下载方式', 0)
+        self.cfg_dl_var = tk.StringVar(value=self.DL_LABELS.get(self.settings.get('downloader', 'auto'), '自动'))
+        self.cfg_dl_box = ttk.Combobox(f2, textvariable=self.cfg_dl_var, values=list(self.DL_LABELS.values()),
+                                       state='readonly', width=8)
+        self.cfg_dl_box.grid(row=3, column=1, sticky='w', padx=(0, 8), pady=4)
+        self.cfg_dl_box.bind('<<ComboboxSelected>>', lambda e: self._on_downloader_pick(self.cfg_dl_var.get()))
+        self.cfg_dl_status = tk.Label(f2, text=self._downloader_status_text(), bg=C['card'], fg=C['faint'],
+                                      font=(FONT_FAMILY, 9), anchor='w')
+        self.cfg_dl_status.grid(row=3, column=2, sticky='w', padx=(0, 10), pady=4)
+        ttk.Button(f2, text='测试 ABDM', command=self.do_test_abdm).grid(row=3, column=3, padx=(0, 8), pady=4)
+        ttk.Button(f2, text='指定 ABDM…', command=self.do_pick_abdm).grid(row=3, column=4, padx=(0, 14), pady=4)
+        self.cfg_hist_var = tk.BooleanVar(value=self.settings.get('keep_history', True))
+        wcheck(f2, 4, self.cfg_hist_var, '保留历史版本（关闭后更新时直接清除旧版本）',
                lambda: self.do_set_keep_history(self.cfg_hist_var.get()))
         wlab(f2, 5, '已有订阅', 0)
         self.cfg_sublist = tk.Listbox(f2, height=3, bg=C['field'], fg=C['text'], relief='flat',
