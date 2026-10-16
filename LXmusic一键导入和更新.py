@@ -519,7 +519,7 @@ DEFAULT_SETTINGS = {
     'backup_enabled': True,
     'backup_dir': '',
     'download_dir': '',
-    'keep_history': False,
+    'keep_history': True,
     'log_enabled': True,
     'log_window': True,
 }
@@ -1208,8 +1208,8 @@ class BaseApp:
             if not assets:
                 return ('noasset', rel, None, None)
             subdir = self._sub_download_dir(sub)
-            if self.settings.get('keep_history') and sub.get('last_tag'):
-                self._archive_previous(subdir, sub['last_tag'])
+            self._archive_previous(subdir, sub.get('last_tag'),
+                                   keep=bool(self.settings.get('keep_history', True)))
             items = []
             for a in assets:
                 target = self._download_asset_file(a, subdir)
@@ -1250,11 +1250,15 @@ class BaseApp:
                     self.log('失败：{}：{}'.format(s.name, err), 'error')
                 sub['last_tag'] = tag
                 save_subscriptions(self.subscriptions)
+                # 更新后自动把该订阅的最新版本音源加载到「待导入音源」
+                self._current_sub = sub.get('repo')
+                loaded = self._load_sub_sources(sub, silent=True)
                 self._view_refresh_subscriptions()
                 self._view_refresh_imported()
                 self._view_status()
-                self.log('订阅「{}」处理完成（新增 {} / 更新 {} / 跳过 {}），重启 LX Music 后生效'.format(
-                    sub['repo'], len(report['added']), len(report['updated']), len(report['skipped'])), 'title')
+                self.log('订阅「{}」处理完成（新增 {} / 更新 {} / 跳过 {}），待导入区已载入 {} 个最新音源，重启 LX Music 后生效'.format(
+                    sub['repo'], len(report['added']), len(report['updated']), len(report['skipped']),
+                    loaded[0] if loaded else 0), 'title')
             except Exception as e:
                 self.log('「{}」下载/解析失败：{}'.format(sub['repo'], e), 'error')
 
@@ -1329,6 +1333,8 @@ class BaseApp:
                     for s, err in report['errors']:
                         self.log('失败：{}：{}'.format(s.name, err), 'error')
                     sub['last_tag'] = tag
+                    if sub.get('repo') == self._current_sub:
+                        self._load_sub_sources(sub, silent=True)
             if has_new:
                 if not self._save_entries('写入 user_api.json'):
                     return
@@ -1412,25 +1418,43 @@ class BaseApp:
     def _sub_download_dir(self, sub):
         return os.path.join(effective_download_dir(self.settings), sub['repo'])
 
-    def _archive_previous(self, subdir, tag):
-        """开启「保存历史订阅」时，把当前下载目录归档到 history/<tag>。"""
+    def _archive_previous(self, subdir, tag, keep=True):
+        """把订阅目录中的旧版本移入 history/<tag>/（keep=False 时直接清除）。
+        返回处理的条目数。这样订阅根目录始终只保留最新版本，不会新旧混杂。"""
         if not os.path.isdir(subdir):
-            return
+            return 0
         items = [n for n in os.listdir(subdir) if n != 'history']
         if not items:
-            return
+            return 0
+        name = ''.join(c for c in str(tag or 'previous') if c not in '\\/:*?"<>|').strip() or 'previous'
+        moved = 0
         try:
-            hist = os.path.join(subdir, 'history', tag)
-            os.makedirs(hist, exist_ok=True)
-            for it in items:
-                s = os.path.join(subdir, it)
-                d = os.path.join(hist, it)
-                if os.path.isdir(s):
-                    shutil.copytree(s, d, dirs_exist_ok=True)
-                else:
-                    shutil.copy2(s, d)
+            if keep:
+                hist = os.path.join(subdir, 'history', name)
+                os.makedirs(hist, exist_ok=True)
+                for it in items:
+                    s = os.path.join(subdir, it)
+                    d = os.path.join(hist, it)
+                    if os.path.isdir(s):
+                        shutil.copytree(s, d, dirs_exist_ok=True)
+                        shutil.rmtree(s, ignore_errors=True)
+                    else:
+                        shutil.move(s, d)
+                    moved += 1
+            else:
+                for it in items:
+                    s = os.path.join(subdir, it)
+                    if os.path.isdir(s):
+                        shutil.rmtree(s, ignore_errors=True)
+                    else:
+                        try:
+                            os.remove(s)
+                        except OSError:
+                            pass
+                    moved += 1
         except Exception:
             pass
+        return moved
 
     def _download_asset_file(self, asset, subdir):
         """把附件下载到订阅目录并返回本地路径（优先 IDM，未装/失败则内置下载）。"""
@@ -1526,14 +1550,14 @@ class BaseApp:
                                         _BLOCK_RE.match(text) is None))
         return scripts
 
-    def do_show_subscription_sources(self, sub):
-        """单击订阅：把该订阅已下载的音源刷新进「待导入音源」列表。"""
-        self._current_sub = sub.get('repo')
-        self._view_refresh_subscriptions()
+    def _load_sub_sources(self, sub, silent=False):
+        """把该订阅目录中「最新版本」的音源加载进待导入列表（先移除该订阅的旧条目）。
+        返回 (新增数, 移除数)，目录不存在时返回 None。"""
         d = self._sub_download_dir(sub)
         if not os.path.isdir(d):
-            self._info('提示', '该订阅还没有本地下载\n\n请先点「一键更新」或双击该订阅下载音源。')
-            return
+            if not silent:
+                self._info('提示', '该订阅还没有本地下载\n\n请先点「一键更新」或双击该订阅下载音源。')
+            return None
         base = os.path.normcase(os.path.abspath(d)) + os.sep
         keep = [s for s in self.candidates
                 if not os.path.normcase(os.path.abspath(s.path)).startswith(base)]
@@ -1550,8 +1574,210 @@ class BaseApp:
             existing.add(key)
             added += 1
         self._view_refresh_candidates()
+        return (added, removed)
+
+    def do_show_subscription_sources(self, sub):
+        """单击订阅：把该订阅已下载的最新音源刷新进「待导入音源」列表。"""
+        self._current_sub = sub.get('repo')
+        self._view_refresh_subscriptions()
+        res = self._load_sub_sources(sub)
+        if res is None:
+            return
+        added, removed = res
         self.log('订阅「{}」：刷新本地音源（移除 {} 个旧条目，加载 {} 个）'.format(sub['repo'], removed, added),
                  'ok' if added else 'warn')
+
+    def _download_root(self):
+        return os.path.normcase(os.path.abspath(effective_download_dir(self.settings))) + os.sep
+
+    def sub_of_path(self, path):
+        # 根据文件路径反查它属于哪个订阅（订阅名是 owner/repo，需按完整下载目录匹配）
+        p = os.path.normcase(os.path.abspath(path))
+        best, best_len = None, -1
+        for s in self.subscriptions:
+            d = os.path.normcase(os.path.abspath(self._sub_download_dir(s))) + os.sep
+            if p.startswith(d) and len(d) > best_len:
+                best, best_len = s, len(d)
+        return best
+
+    def history_versions_of_file(self, path):
+        # 列出与给定文件同名的历史版本 [(tag, 路径)]（新 → 旧）
+        sub = self.sub_of_path(path)
+        if not sub:
+            return []
+        d = self._sub_download_dir(sub)
+        hist_root = os.path.join(d, 'history')
+        if not os.path.isdir(hist_root):
+            return []
+        try:
+            rel = os.path.relpath(path, d)
+        except ValueError:
+            return []
+        parts = rel.split(os.sep)
+        if parts and parts[0] == 'history':
+            rel = os.path.join(*parts[2:]) if len(parts) > 2 else os.path.basename(path)
+        out = []
+        for tag in sorted(os.listdir(hist_root), reverse=True):
+            vdir = os.path.join(hist_root, tag)
+            if not os.path.isdir(vdir):
+                continue
+            cand = os.path.join(vdir, rel)
+            if os.path.isfile(cand):
+                out.append((tag, cand))
+        return out
+
+    def load_file_as_candidate(self, path, label=''):
+        # 把磁盘上的某个 .js 读进待导入列表（供历史版本切换使用）
+        if not os.path.isfile(path):
+            self._info('提示', '文件不存在：{}'.format(path))
+            return False
+        key = os.path.normcase(os.path.abspath(path))
+        if any(os.path.normcase(os.path.abspath(s.path)) == key for s in self.candidates):
+            self.log('「{}」已在待导入列表中'.format(os.path.basename(path)), 'warn')
+            return False
+        text, enc = read_text_auto(path)
+        meta = parse_script_meta(text, fallback_name=os.path.splitext(os.path.basename(path))[0])
+        sub = self.sub_of_path(path)
+        base = self._sub_download_dir(sub) if sub else os.path.dirname(path)
+        try:
+            rel = os.path.relpath(path, base)
+        except ValueError:
+            rel = os.path.basename(path)
+        self.candidates.append(SourceScript(path, rel, text, meta, enc, _BLOCK_RE.match(text) is None))
+        self._view_refresh_candidates()
+        self.log('已载入历史版本{}：{}  v{}'.format(label, meta.get('name'), meta.get('version')), 'ok')
+        return True
+
+    def versions_for_entry(self, entry):
+        # 在全部订阅的最新版本与历史版本中，查找与已导入音源同名的可切换版本
+        target = normalize_name(entry.get('name', ''))
+        out = []
+        for sub in self.subscriptions:
+            d = self._sub_download_dir(sub)
+            if not os.path.isdir(d):
+                continue
+            found = []
+            for s in scan_source_folder(d):
+                if normalize_name(s.name) == target:
+                    found.append((sub.get('last_tag') or '最新', s.path))
+            hist_root = os.path.join(d, 'history')
+            if os.path.isdir(hist_root):
+                for tag in sorted(os.listdir(hist_root), reverse=True):
+                    vdir = os.path.join(hist_root, tag)
+                    if not os.path.isdir(vdir):
+                        continue
+                    for s in scan_source_folder(vdir):
+                        if normalize_name(s.name) == target:
+                            found.append((tag, s.path))
+            for tag, p in found:
+                out.append(('{} · {}'.format(sub['repo'], tag), p))
+        return out
+
+    def switch_entry_script(self, entry, path):
+        # 把已导入音源切换为指定文件（历史版本回退 / 前移）
+        if not os.path.isfile(path):
+            self._info('提示', '文件不存在：{}'.format(path))
+            return
+        text, _enc = read_text_auto(path)
+        meta = parse_script_meta(text, fallback_name=os.path.splitext(os.path.basename(path))[0])
+        comp = compress_script(text)
+        if (entry.get('script') or '') == comp:
+            self._info('提示', '当前已经是这个版本，无需切换')
+            return
+        if not self._auto_backup():
+            return
+        old_v = entry.get('version', '?')
+        entry['name'] = meta.get('name') or entry.get('name')
+        entry['description'] = meta.get('description', entry.get('description', ''))
+        entry['version'] = meta.get('version', entry.get('version', ''))
+        entry['author'] = meta.get('author', entry.get('author', ''))
+        entry['homepage'] = meta.get('homepage', entry.get('homepage', ''))
+        entry['script'] = comp
+        if not self._save_entries('切换音源版本'):
+            return
+        self._view_refresh_imported()
+        self._view_status()
+        self.log('已切换「{}」：v{} → v{}'.format(entry.get('name'), old_v, entry.get('version')), 'update')
+
+    def _popup_menu(self, event, items):
+        # 通用右键菜单：None=分隔线；(label, 回调)=命令；(label, None)=禁用；
+        # (label, [子项…])=级联子菜单
+        C = self.C
+        font = getattr(self, 'f_small', None)
+
+        def build(parent, rows):
+            for row in rows:
+                if row is None:
+                    parent.add_separator()
+                    continue
+                label, action = row[0], row[1]
+                if isinstance(action, (list, tuple)):
+                    sub = tk.Menu(parent, tearoff=0, bg=C['card'], fg=C['text'],
+                                  activebackground=C['card2'], activeforeground=C['text'],
+                                  bd=0, relief='flat', font=font)
+                    build(sub, action)
+                    parent.add_cascade(label=label, menu=sub)
+                elif action is None:
+                    parent.add_command(label=label, state='disabled')
+                else:
+                    parent.add_command(label=label, command=action)
+
+        menu = tk.Menu(self.root, tearoff=0, bg=C['card'], fg=C['text'],
+                       activebackground=C['card2'], activeforeground=C['text'],
+                       bd=0, relief='flat', font=font)
+        build(menu, items)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except Exception:
+                pass
+
+    def show_candidate_menu(self, event, i):
+        # 待导入音源右键：历史版本切换 / 查看详情
+        if not (0 <= i < len(self.candidates)):
+            return
+        s = self.candidates[i]
+        vers = self.history_versions_of_file(s.path)
+        rows = []
+        if vers:
+            rows.append(('历史版本（{} 个）'.format(len(vers)),
+                         [('v{}'.format(t), (lambda p=p: self.load_file_as_candidate(p, ''))) for t, p in vers]))
+        else:
+            rows.append(('无历史版本', None))
+        rows.append(None)
+        rows.append(('查看详情', lambda: self._cand_detail(i)))
+        self._popup_menu(event, rows)
+
+    def show_imported_menu(self, event, i):
+        # 已导入音源右键：在订阅的历史版本之间切换
+        if not (0 <= i < len(self.entries)):
+            return
+        e = self.entries[i]
+        vers = self.versions_for_entry(e)
+        rows = []
+        if vers:
+            rows.append(('切换版本（{} 个）'.format(len(vers)),
+                         [(lbl, (lambda p=p: self.switch_entry_script(e, p))) for lbl, p in vers]))
+        else:
+            rows.append(('无可切换版本', None))
+        rows.append(None)
+        rows.append(('查看详情', lambda: self._imported_detail(i)))
+        self._popup_menu(event, rows)
+
+    def show_sub_menu(self, event, i):
+        # 订阅右键：载入最新音源 / 更新 / 打开目录 / 删除
+        if not (0 <= i < len(self.subscriptions)):
+            return
+        sub = self.subscriptions[i]
+        self._popup_menu(event, [
+            ('载入最新音源', lambda: self.do_show_subscription_sources(sub)),
+            ('立即检查更新', lambda: self.do_update_subscription(sub)),
+            None,
+            ('打开下载目录', lambda: self.do_open_download_dir(sub)),
+            ('删除订阅', lambda: self.do_delete_subscription(sub)),
+        ])
 
     def do_open_download_dir(self, sub=None):
         d = self._sub_download_dir(sub) if sub else effective_download_dir(self.settings)
@@ -2233,6 +2459,7 @@ class CtkApp(BaseApp):
             w.bind('<Enter>', lambda e, idx=i, frm=row: self._row_enter(frm, idx))
             w.bind('<Leave>', lambda e, idx=i, frm=row: self._row_leave(frm, idx))
             w.bind('<Double-Button-1>', lambda e, idx=i: self._cand_detail(idx))
+            w.bind('<Button-3>', lambda e, idx=i: self.show_candidate_menu(e, idx))
 
     def _cand_toggle(self, i):
         if i in self.checked_candidates:
@@ -2288,6 +2515,7 @@ class CtkApp(BaseApp):
             w.bind('<Enter>', lambda ev, idx=i, frm=row: self._imp_enter(frm, idx))
             w.bind('<Leave>', lambda ev, idx=i, frm=row: self._imp_leave(frm, idx))
             w.bind('<Double-Button-1>', lambda ev, idx=i: self._imported_detail(idx))
+            w.bind('<Button-3>', lambda ev, idx=i: self.show_imported_menu(ev, idx))
 
     def _imp_toggle(self, i):
         if i in self.checked_imported:
@@ -2393,7 +2621,7 @@ class CtkApp(BaseApp):
                           font=self.f_small, anchor='w', cursor='hand2')
         name_l.pack(side='left', padx=(14, 6), pady=5)
         tag = sub.get('last_tag')
-        st_l = tk.Label(row, text=('已用 ' + tag) if tag else '未导入', bg=row_bg,
+        st_l = tk.Label(row, text=('当前 ' + tag) if tag else '未导入', bg=row_bg,
                         fg=C['green'] if tag else C['faint'], font=self.f_tiny, cursor='hand2')
         st_l.pack(side='right', padx=10, pady=5)
         self.sub_rows[i] = row
@@ -2402,6 +2630,7 @@ class CtkApp(BaseApp):
             w.bind('<Double-Button-1>', lambda e, s=sub: self.do_update_subscription(s))
             w.bind('<Enter>', lambda e, frm=row, cur=is_current: self._sub_enter(frm, cur))
             w.bind('<Leave>', lambda e, frm=row, cur=is_current: self._sub_leave(frm, cur))
+            w.bind('<Button-3>', lambda e, idx=i: self.show_sub_menu(e, idx))
 
     def _sub_enter(self, row, is_current):
         if not is_current:
@@ -2941,6 +3170,7 @@ class TtkApp(BaseApp):
         self.cand_tree.grid(row=3, column=0, sticky='nsew', pady=2)
         self.cand_tree.bind('<Button-1>', self._on_cand_click)
         self.cand_tree.bind('<Double-1>', self._on_cand_double)
+        self.cand_tree.bind('<Button-3>', self._on_cand_menu)
         vsb = ttk.Scrollbar(left, orient='vertical', command=self.cand_tree.yview)
         self.cand_tree.configure(yscrollcommand=vsb.set)
         vsb.grid(row=3, column=1, sticky='ns')
@@ -2983,6 +3213,7 @@ class TtkApp(BaseApp):
         self.imp_tree.grid(row=1, column=0, sticky='nsew', pady=(4, 2))
         self.imp_tree.bind('<<TreeviewSelect>>', self._on_imp_select)
         self.imp_tree.bind('<Double-1>', self._on_imp_double)
+        self.imp_tree.bind('<Button-3>', self._on_imp_menu)
         vsb2 = ttk.Scrollbar(right, orient='vertical', command=self.imp_tree.yview)
         self.imp_tree.configure(yscrollcommand=vsb2.set)
         vsb2.grid(row=1, column=1, sticky='ns')
@@ -3042,6 +3273,7 @@ class TtkApp(BaseApp):
         self.sub_tree.grid(row=1, column=0, sticky='ew', pady=(6, 0))
         self.sub_tree.bind('<Button-1>', self._on_sub_click)
         self.sub_tree.bind('<Double-1>', self._on_sub_double)
+        self.sub_tree.bind('<Button-3>', self._on_sub_menu)
         vsbs = ttk.Scrollbar(sub, orient='vertical', command=self.sub_tree.yview)
         self.sub_tree.configure(yscrollcommand=vsbs.set)
         vsbs.grid(row=1, column=1, sticky='ns', pady=(6, 0))
@@ -3172,6 +3404,21 @@ class TtkApp(BaseApp):
                 self.bk_box.selection_set(i)
 
     # ---------------- 订阅 ----------------
+    def _on_cand_menu(self, event):
+        row = self.cand_tree.identify_row(event.y)
+        if row:
+            self.show_candidate_menu(event, int(row))
+
+    def _on_imp_menu(self, event):
+        row = self.imp_tree.identify_row(event.y)
+        if row:
+            self.show_imported_menu(event, int(row))
+
+    def _on_sub_menu(self, event):
+        row = self.sub_tree.identify_row(event.y)
+        if row:
+            self.show_sub_menu(event, int(row))
+
     def _on_sub_click(self, event):
         row = self.sub_tree.identify_row(event.y)
         if row and 0 <= int(row) < len(self.subscriptions):
@@ -3189,7 +3436,7 @@ class TtkApp(BaseApp):
         for i, sub in enumerate(self.subscriptions):
             tag = sub.get('last_tag')
             tree.insert('', 'end', iid=str(i),
-                        values=(short(sub.get('repo', ''), 26), ('已用 ' + tag) if tag else '未导入'),
+                        values=(short(sub.get('repo', ''), 26), ('当前 ' + tag) if tag else '未导入'),
                         tags=('cur',) if sub.get('repo') == self._current_sub else ())
 
     def _view_apply_backup_visible(self):
