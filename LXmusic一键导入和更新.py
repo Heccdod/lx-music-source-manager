@@ -417,6 +417,78 @@ def source_assets_of(release):
     return out
 
 
+def fetch_repo_meta(repo, timeout=20):
+    """读取仓库信息（用于拿默认分支）。"""
+    owner, name = parse_repo_ref(repo)
+    try:
+        return _gh_get('{}/repos/{}/{}'.format(GITHUB_API, owner, name), timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise ValueError('仓库不存在或不可访问（私有仓库暂不支持）')
+        raise ConnectionError('GitHub API 返回 HTTP {}'.format(e.code))
+    except urllib.error.URLError as e:
+        raise ConnectionError('网络错误：{}'.format(e.reason))
+
+
+def fetch_repo_files(repo, subpath='', branch='', timeout=20, max_dirs=40):
+    """列出仓库指定目录下的全部 .js 文件（递归，跳过隐藏目录与 node_modules）。
+    返回 (files, ref)；files 每项含 path / name / size / download_url / _ref。"""
+    owner, name = parse_repo_ref(repo)
+    ref = (branch or '').strip()
+    if not ref:
+        ref = (fetch_repo_meta(repo, timeout).get('default_branch') or 'main')
+    out = []
+    stack = [(subpath or '').strip('/')]
+    seen = 0
+    while stack and seen < max_dirs:
+        p = stack.pop()
+        seen += 1
+        url = '{}/repos/{}/{}/contents/{}?ref={}'.format(
+            GITHUB_API, owner, name, urllib.parse.quote(p), urllib.parse.quote(ref))
+        try:
+            items = _gh_get(url, timeout)
+        except urllib.error.HTTPError as e:
+            if e.code == 404 and not p:
+                raise ValueError('仓库目录不存在：{}'.format(subpath or '/'))
+            continue
+        except urllib.error.URLError as e:
+            raise ConnectionError('网络错误：{}'.format(e.reason))
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            t = it.get('type')
+            if t == 'dir':
+                dn = it.get('name', '')
+                if dn.startswith('.') or dn == 'node_modules':
+                    continue
+                stack.append(it.get('path', ''))
+            elif t == 'file' and it.get('name', '').lower().endswith('.js'):
+                out.append({'path': it.get('path', ''), 'name': it.get('name', ''),
+                            'size': it.get('size', 0), 'download_url': it.get('download_url', ''),
+                            '_ref': ref})
+    out.sort(key=lambda x: x['path'])
+    return out, ref
+
+
+def repo_revision(repo, subpath='', branch='', timeout=20):
+    """取该目录最后一次提交的短 sha 与时间，作为「版本标记」。"""
+    owner, name = parse_repo_ref(repo)
+    url = '{}/repos/{}/{}/commits?per_page=1'.format(GITHUB_API, owner, name)
+    if subpath:
+        url += '&path=' + urllib.parse.quote(subpath.strip('/'))
+    if branch:
+        url += '&sha=' + urllib.parse.quote(branch)
+    try:
+        data = _gh_get(url, timeout)
+    except Exception:
+        return '', ''
+    if isinstance(data, list) and data:
+        sha = (data[0].get('sha') or '')[:7]
+        date = ((data[0].get('commit') or {}).get('committer') or {}).get('date', '')
+        return sha, date
+    return '', ''
+
+
 def _safe_extract_zip(zip_path, dest, password=None):
     """安全解压 zip 到目标目录（拦截路径穿越；支持密码；失败时清理半截文件）。"""
     base = os.path.normcase(os.path.abspath(dest)) + os.sep
@@ -1130,13 +1202,97 @@ class BaseApp:
         except Exception as e:
             self.log('任务回调异常：{}'.format(e), 'error')
 
+    def _view_subscription_form(self, repo_text=''):
+        # 添加订阅表单：仓库 + 来源（Release 附件 / 仓库目录）+ 目录路径 + 分支
+        C = self.C
+        f_small = getattr(self, 'f_small', None)
+        if not isinstance(f_small, tuple):
+            f_small = (FONT_FAMILY, 10)
+        f_bold = getattr(self, 'f_bold', None)
+        if not isinstance(f_bold, tuple):
+            f_bold = (FONT_FAMILY, 10, 'bold')
+        dlg = tk.Toplevel(self.root)
+        dlg.title('添加订阅')
+        dlg.configure(bg=C['card'])
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+        body = tk.Frame(dlg, bg=C['card'])
+        body.pack(padx=20, pady=(16, 0), fill='both')
+        body.grid_columnconfigure(0, weight=1)
+
+        def lab(r, text, color=None):
+            tk.Label(body, text=text, bg=C['card'], fg=color or C['muted'], font=f_small,
+                     anchor='w').grid(row=r, column=0, sticky='w', pady=(9, 2))
+
+        def entry(r, var, width=46):
+            e = tk.Entry(body, textvariable=var, width=width, bg=C['field'], fg=C['text'],
+                         relief='flat', highlightthickness=1, highlightbackground=C['border'],
+                         highlightcolor=C['accent'], font=f_small, insertbackground=C['text'])
+            e.grid(row=r, column=0, sticky='ew', ipady=5)
+            return e
+
+        var_repo = tk.StringVar(value=repo_text or '')
+        var_path = tk.StringVar()
+        var_branch = tk.StringVar()
+        kind = tk.StringVar(value='release')
+        lab(0, 'GitHub 仓库（owner/repo 或完整链接）')
+        e_repo = entry(1, var_repo)
+        lab(2, '来源')
+        pick = tk.Frame(body, bg=C['card'])
+        pick.grid(row=3, column=0, sticky='w')
+        for val, txt in (('release', 'Release 附件（默认，读取最新 Release 的 .js / .zip）'),
+                         ('repo', '仓库目录（音源直接放在仓库里，逐个读取 .js）')):
+            tk.Radiobutton(pick, text=txt, value=val, variable=kind, bg=C['card'], fg=C['text'],
+                           selectcolor=C['card2'], activebackground=C['card'],
+                           activeforeground=C['text'], font=f_small, anchor='w',
+                           highlightthickness=0, bd=0).pack(anchor='w')
+        lab(4, '目录路径（仅仓库目录模式；留空 = 仓库根目录，如 js / sources）')
+        entry(5, var_path)
+        lab(6, '分支（留空 = 默认分支）')
+        entry(7, var_branch)
+        tk.Label(body, text='不确定就保持「Release 附件」：仓库把音源打包进 Release 时用它；\n'
+                            '若音源直接放在仓库目录（如根目录 / js 目录）里，请选「仓库目录」。',
+                 bg=C['card'], fg=C['faint'], font=f_small, justify='left', anchor='w').grid(
+            row=8, column=0, sticky='w', pady=(10, 0))
+        btns = tk.Frame(dlg, bg=C['card'])
+        btns.pack(pady=(12, 16))
+        result = {}
+
+        def ok():
+            result['repo'] = var_repo.get().strip()
+            result['source'] = kind.get()
+            result['path'] = var_path.get().strip()
+            result['branch'] = var_branch.get().strip()
+            dlg.destroy()
+
+        tk.Button(btns, text='取消', width=10, bg=C['card'], fg=C['muted'], relief='flat',
+                  activebackground=C['hover'], activeforeground=C['text'], font=f_small,
+                  command=dlg.destroy).pack(side='left', padx=6)
+        tk.Button(btns, text='添加', width=10, bg=C['accent'], fg='#fffaf5', relief='flat',
+                  activebackground=C['accent_hover'], activeforeground='#fffaf5', font=f_bold,
+                  command=ok).pack(side='left', padx=6)
+        e_repo.bind('<Return>', lambda e: ok())
+        try:
+            dlg.update_idletasks()
+            x = self.root.winfo_rootx() + max((self.root.winfo_width() - dlg.winfo_reqwidth()) // 2, 0)
+            y = self.root.winfo_rooty() + max((self.root.winfo_height() - dlg.winfo_reqheight()) // 3, 0)
+            dlg.geometry('+{}+{}'.format(x, y))
+        except Exception:
+            pass
+        dlg.after(80, e_repo.focus_set)
+        dlg.wait_window()
+        return result or None
+
     def do_add_subscription(self, repo_ref=None):
-        if repo_ref is None:
-            repo_ref = self._view_input('添加订阅', '请输入 GitHub 仓库：\n\n格式：owner/repo，或完整仓库链接（https://github.com/xxx/yyy）')
-        if not repo_ref:
+        if repo_ref is not None:
+            form = {'repo': repo_ref, 'source': 'release', 'path': '', 'branch': ''}
+        else:
+            form = self._view_subscription_form()
+        if not form or not (form.get('repo') or '').strip():
             return
         try:
-            owner, repo = parse_repo_ref(repo_ref)
+            owner, repo = parse_repo_ref(form['repo'])
         except ValueError as e:
             self._info('无法添加', str(e))
             return
@@ -1144,20 +1300,47 @@ class BaseApp:
         if any(s.get('repo') == key for s in self.subscriptions):
             self._info('提示', '该仓库已在订阅列表中')
             return
+        src = form.get('source') or 'release'
+        subpath = (form.get('path') or '').strip().strip('/')
+        branch = (form.get('branch') or '').strip()
 
         def fetch():
-            return fetch_latest_release(owner, repo)
+            if src == 'repo':
+                files, ref = fetch_repo_files(key, subpath, branch)
+                rev, _date = repo_revision(key, subpath, branch)
+                return {'kind': 'repo', 'files': files, 'ref': ref, 'rev': rev}
+            return {'kind': 'release', 'rel': fetch_latest_release(owner, repo)}
 
         def done(ok, payload):
             if not ok:
-                self._info('添加失败', '无法获取该仓库的最新 Release：\n{}'.format(payload))
+                self._info('添加失败', '无法读取该仓库：\n\n{}'.format(payload))
                 return
-            rel = payload
+            if payload['kind'] == 'repo':
+                files = payload['files']
+                if not files:
+                    self._info('添加失败', '该目录下没有找到 .js 音源文件{}'.format(
+                        '（目录：{}）'.format(subpath) if subpath else '（仓库根目录）'))
+                    return
+                tag = payload.get('rev') or payload.get('ref') or ''
+                sub = {'repo': key, 'name': key, 'last_tag': '', 'source': 'repo',
+                       'path': subpath, 'branch': branch,
+                       'added_at': time.strftime('%Y-%m-%d %H:%M:%S')}
+                self.subscriptions.append(sub)
+                save_subscriptions(self.subscriptions)
+                self._view_refresh_subscriptions()
+                self.log('已添加订阅：{}（仓库目录{}，找到 {} 个音源，最新提交 {}）'.format(
+                    key, ' ' + subpath if subpath else ' 根目录', len(files), tag or '?'), 'ok')
+                if self._confirm('立即下载并导入？', '是否立即下载「{}」目录下的 {} 个音源并导入？'.format(key, len(files))):
+                    self.do_update_subscription(sub)
+                return
+            rel = payload['rel']
             assets = source_assets_of(rel)
             if not assets:
-                self._info('添加失败', '最新版本「{}」的附件中没有 .js / .zip 音源'.format(rel.get('tag_name', '?')))
+                self._info('添加失败', '最新版本「{}」的附件中没有 .js / .zip 音源。\n\n'
+                                       '如果该仓库把音源直接放在目录里，请改用「仓库目录」来源。'.format(rel.get('tag_name', '?')))
                 return
             sub = {'repo': key, 'name': key, 'last_tag': '', 'asset_names': [a['name'] for a in assets],
+                   'source': 'release', 'path': '', 'branch': branch,
                    'added_at': time.strftime('%Y-%m-%d %H:%M:%S')}
             self.subscriptions.append(sub)
             save_subscriptions(self.subscriptions)
@@ -1166,7 +1349,8 @@ class BaseApp:
             if self._confirm('立即下载并导入？', '是否立即下载「{}」的最新版本并导入？\n\n当前最新版本：{}'.format(key, rel.get('tag_name'))):
                 self.do_update_subscription(sub)
 
-        self._run_task(fetch, done, '正在查询 {} 的最新 Release…'.format(key))
+        tip = '正在读取 {} 的仓库目录…'.format(key) if src == 'repo' else '正在查询 {} 的最新 Release…'.format(key)
+        self._run_task(fetch, done, tip)
 
     def do_check_subscriptions(self):
         if not self.subscriptions:
@@ -1200,29 +1384,14 @@ class BaseApp:
 
     def do_update_subscription(self, sub):
         def work():
-            rel = fetch_latest_release(*sub['repo'].split('/'))
-            tag = rel.get('tag_name', '')
-            if tag and tag == sub.get('last_tag'):
-                return ('skip', rel, None, None)
-            assets = source_assets_of(rel)
-            if not assets:
-                return ('noasset', rel, None, None)
-            subdir = self._sub_download_dir(sub)
-            self._archive_previous(subdir, sub.get('last_tag'),
-                                   keep=bool(self.settings.get('keep_history', True)))
-            items = []
-            for a in assets:
-                target = self._download_asset_file(a, subdir)
-                items.append((target, a.get('name', 'asset')))
-            return ('new', rel, subdir, items)
+            return self._fetch_sub_update(sub)
 
         def done(ok, payload):
             if not ok:
                 self.log('「{}」更新失败：{}'.format(sub['repo'], payload), 'error')
                 self._view_refresh_subscriptions()
                 return
-            kind, rel, subdir, items = payload
-            tag = rel.get('tag_name', '')
+            kind, tag, subdir, items = payload
             if kind == 'skip':
                 self.log('「{}」已是最新版本 {}，无需更新'.format(sub['repo'], tag), 'ok')
                 self._view_refresh_subscriptions()
@@ -1276,23 +1445,13 @@ class BaseApp:
             out = []
             for sub in subs:
                 try:
-                    rel = fetch_latest_release(*sub['repo'].split('/'))
-                    tag = rel.get('tag_name', '')
-                    if tag and tag == sub.get('last_tag'):
+                    kind, tag, subdir, items = self._fetch_sub_update(sub)
+                    if kind == 'skip':
                         out.append((sub, 'skip', tag))
-                        continue
-                    assets = source_assets_of(rel)
-                    if not assets:
+                    elif kind == 'noasset':
                         out.append((sub, 'noasset', tag))
-                        continue
-                    subdir = self._sub_download_dir(sub)
-                    if self.settings.get('keep_history') and sub.get('last_tag'):
-                        self._archive_previous(subdir, sub['last_tag'])
-                    items = []
-                    for a in assets:
-                        target = self._download_asset_file(a, subdir)
-                        items.append((target, a.get('name', 'asset')))
-                    out.append((sub, 'new', tag, subdir, items))
+                    else:
+                        out.append((sub, 'new', tag, subdir, items))
                 except Exception as e:
                     out.append((sub, 'err', str(e)))
             return out
@@ -1487,6 +1646,49 @@ class BaseApp:
             with open(target, 'wb') as f:
                 f.write(data)
         return target
+
+    def _download_repo_file(self, repo, item, subdir):
+        """把仓库里的单个 .js 下载到订阅目录（复用 IDM/内置下载逻辑）。"""
+        owner, name = parse_repo_ref(repo)
+        path = item.get('path', '')
+        fname = os.path.basename(path) or 'source.js'
+        url = item.get('download_url') or 'https://raw.githubusercontent.com/{}/{}/{}/{}'.format(
+            owner, name, item.get('_ref') or 'HEAD', path)
+        return self._download_asset_file({'name': fname, 'browser_download_url': url}, subdir)
+
+    def _fetch_sub_update(self, sub):
+        """检查订阅是否有新版本并在后台线程完成下载。
+        返回 (kind, tag, subdir, items)；kind 为 skip / noasset / new。
+        支持两种来源：release（默认，读 Release 附件）与 repo（读仓库目录里的 .js）。"""
+        kind = (sub.get('source') or 'release').lower()
+        keep = bool(self.settings.get('keep_history', True))
+        if kind == 'repo':
+            files, ref = fetch_repo_files(sub['repo'], sub.get('path', ''), sub.get('branch', ''))
+            rev, _date = repo_revision(sub['repo'], sub.get('path', ''), sub.get('branch', ''))
+            tag = rev or ref
+            if not files:
+                return ('noasset', tag, None, None)
+            if tag and tag == sub.get('last_tag'):
+                return ('skip', tag, None, None)
+            subdir = self._sub_download_dir(sub)
+            self._archive_previous(subdir, sub.get('last_tag'), keep=keep)
+            items = []
+            for f in files:
+                items.append((self._download_repo_file(sub['repo'], f, subdir), f['name']))
+            return ('new', tag, subdir, items)
+        rel = fetch_latest_release(*sub['repo'].split('/'))
+        tag = rel.get('tag_name', '')
+        if tag and tag == sub.get('last_tag'):
+            return ('skip', tag, None, None)
+        assets = source_assets_of(rel)
+        if not assets:
+            return ('noasset', tag, None, None)
+        subdir = self._sub_download_dir(sub)
+        self._archive_previous(subdir, sub.get('last_tag'), keep=keep)
+        items = []
+        for a in assets:
+            items.append((self._download_asset_file(a, subdir), a.get('name', 'asset')))
+        return ('new', tag, subdir, items)
 
     def _unzip_with_password(self, target, dest, name):
         # 解压已下载的 zip；加密时弹窗询问密码（仅主线程调用，可弹对话框）
@@ -2620,12 +2822,16 @@ class CtkApp(BaseApp):
         name_l = tk.Label(row, text=short(sub.get('repo', ''), 24), bg=row_bg, fg=C['text'],
                           font=self.f_small, anchor='w', cursor='hand2')
         name_l.pack(side='left', padx=(14, 6), pady=5)
+        if (sub.get('source') or 'release') == 'repo':
+            src_l = tk.Label(row, text='目录' + ('/' + sub['path'] if sub.get('path') else ''),
+                             bg=row_bg, fg=C['warn'], font=self.f_tiny, cursor='hand2')
+            src_l.pack(side='left', padx=(0, 6), pady=5)
         tag = sub.get('last_tag')
         st_l = tk.Label(row, text=('当前 ' + tag) if tag else '未导入', bg=row_bg,
                         fg=C['green'] if tag else C['faint'], font=self.f_tiny, cursor='hand2')
         st_l.pack(side='right', padx=10, pady=5)
         self.sub_rows[i] = row
-        for w in (row, name_l, st_l):
+        for w in [row, name_l, st_l] + ([src_l] if (sub.get('source') or 'release') == 'repo' else []):
             w.bind('<Button-1>', lambda e, s=sub: self.do_show_subscription_sources(s))
             w.bind('<Double-Button-1>', lambda e, s=sub: self.do_update_subscription(s))
             w.bind('<Enter>', lambda e, frm=row, cur=is_current: self._sub_enter(frm, cur))
@@ -3436,7 +3642,8 @@ class TtkApp(BaseApp):
         for i, sub in enumerate(self.subscriptions):
             tag = sub.get('last_tag')
             tree.insert('', 'end', iid=str(i),
-                        values=(short(sub.get('repo', ''), 26), ('当前 ' + tag) if tag else '未导入'),
+                        values=(short(sub.get('repo', '') + (' 「目录」' if (sub.get('source') or 'release') == 'repo' else ''), 26),
+                                ('当前 ' + tag) if tag else '未导入'),
                         tags=('cur',) if sub.get('repo') == self._current_sub else ())
 
     def _view_apply_backup_visible(self):
