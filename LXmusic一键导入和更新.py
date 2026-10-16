@@ -163,6 +163,12 @@ def short(text, n):
     return text if len(text) <= n else text[:n - 1] + '…'
 
 
+def version_key(version):
+    """版本号比较键：先比数字序列，再比原字符串（用于同批同名音源取最高版本）。"""
+    text = str(version or '')
+    return ([int(x) for x in re.findall(r'\d+', text)], text)
+
+
 def short_path(path, limit=52):
     """路径过长时中间省略，保留盘符与文件名。"""
     path = path or ''
@@ -1175,7 +1181,7 @@ class BaseApp:
         for s, old_v, new_v in report['updated']:
             self.log('更新：{}  v{} → v{}'.format(s.name, old_v, new_v), 'update')
             ok_ids.add(id(s))
-        for s in report['added']:
+        for s, in report['added']:
             self.log('新增：{}  v{}'.format(s.name, s.version), 'ok')
             ok_ids.add(id(s))
         for s, reason in report['skipped']:
@@ -1531,7 +1537,7 @@ class BaseApp:
                     return
                 for s, old_v, new_v in report['updated']:
                     self.log('更新：{}  v{} → v{}（来自 {}）'.format(s.name, old_v, new_v, sub['repo']), 'update')
-                for s in report['added']:
+                for s, in report['added']:
                     self.log('新增：{}  v{}（来自 {}）'.format(s.name, s.version, sub['repo']), 'ok')
                 for s, reason in report['skipped']:
                     self.log('跳过：{}（{}）'.format(s.name, reason), 'warn')
@@ -1605,7 +1611,7 @@ class BaseApp:
                     report = apply_imports(self.entries, scripts, 'update')
                     for s, old_v, new_v in report['updated']:
                         self.log('更新：{}  v{} → v{}'.format(s.name, old_v, new_v), 'update')
-                    for s in report['added']:
+                    for s, in report['added']:
                         self.log('新增：{}  v{}'.format(s.name, s.version), 'ok')
                     for s, reason in report['skipped']:
                         self.log('跳过：{}（{}）'.format(s.name, reason), 'warn')
@@ -2066,8 +2072,8 @@ class BaseApp:
                 raise ValueError('解压失败：{}'.format(e))
             items = []
             for root2, dirs2, files2 in os.walk(subdir):
-                dirs2[:] = [d for d in dirs2 if d != 'history']
-                for fn in files2:
+                dirs2[:] = sorted(d for d in dirs2 if d != 'history')
+                for fn in sorted(files2):
                     if fn.lower().endswith('.js'):
                         items.append(os.path.join(root2, fn))
             if not items:
@@ -2078,12 +2084,25 @@ class BaseApp:
                 pass
         else:
             items = [target]
-        scripts = []
+        parsed = []
         for p in items:
-            with open(p, 'rb') as f:
-                content = f.read()
-            text, enc = decode_script_bytes(content)
-            meta = parse_script_meta(text, fallback_name=os.path.splitext(os.path.basename(p))[0])
+            try:
+                with open(p, 'rb') as f:
+                    content = f.read()
+                text, enc = decode_script_bytes(content)
+                meta = parse_script_meta(text, fallback_name=os.path.splitext(os.path.basename(p))[0])
+            except Exception:
+                continue
+            parsed.append((p, text, meta, enc))
+        # 同一个压缩包内可能包含同名音源的多个版本：只保留版本号最高的那个，避免越更新版本越低
+        best = {}
+        for item in parsed:
+            key = normalize_name(item[2].get('name', ''))
+            prev = best.get(key)
+            if prev is None or version_key(item[2].get('version')) >= version_key(prev[2].get('version')):
+                best[key] = item
+        scripts = []
+        for p, text, meta, enc in sorted(best.values(), key=lambda it: it[2].get('name', '')):
             scripts.append(SourceScript(p, os.path.relpath(p, subdir), text, meta, enc,
                                         _BLOCK_RE.match(text) is None))
         return scripts
@@ -4242,6 +4261,12 @@ def run_selftest(force_ttk=False):
         assert len(bm.list_files()) == 2
         bm.delete([os.path.basename(p2)])
         assert len(bm.list_files()) == 1
+        _meta = parse_script_meta('/*!' + chr(10) + ' * @name 新源' + chr(10) + ' * @version 1.0'
+                                 + chr(10) + ' */' + chr(10) + ';(function(){})()')
+        _demo = apply_imports([], [SourceScript('/tmp/x.js', 'x.js', 'aa', _meta, 'utf-8', False)], 'add')
+        assert len(_demo['added']) == 1 and _demo['added'][0][0].name == '新源', 'report[added] 应为 (s,) 一元组'
+        assert version_key('v9.3') > version_key('v4.1'), '版本号比较异常'
+        assert version_key('260925') > version_key('260809'), '日期式版本比较异常'
         report.append('核心逻辑 OK（扫描/解析/导入/更新/去重/备份/读写）')
 
         # ---- 订阅逻辑（本地，无网络） ----
