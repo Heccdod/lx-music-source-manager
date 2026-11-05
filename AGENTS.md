@@ -213,21 +213,41 @@ subagent(
 
 ---
 
-## 7. 子代理模型白名单（重要限制）
+## 7. 模型分工：谁跑哪个模型（最容易搞反的地方）
 
-DSH 对子代理可用的模型有白名单限制，当前实测：
+**核心原则：贵模型当大脑，便宜模型当手。**
+Argon 只做规划（token 消耗小），Flash 干编码（0.11x 便宜）。
+
+| 角色 | 跑在哪 | provider / model | 怎么设置 |
+|---|---|---|---|
+| **规划者** | **会话模型**（整个对话用哪个模型） | `antigravity/gemini-4-argon-high` | 会话头的模型选择器里选 |
+| **编码者** | **子代理**（`subagent` 起的临时 agent） | `workbuddy/deepseek-v4.1-flash` | `subagent(...)` 里显式指定 |
+
+### 7.1 子代理白名单（现状已够用，不需要改）
+
+DSH 对**子代理**可用的模型有白名单，当前实测：
 
 ```
-workbuddy — WorkBuddy
-  workbuddy/deepseek-v4.1-flash — DeepSeek-V4.1-Flash · x0.11  ✅ 可用
-  workbuddy/gemini-3.8-flash    ❌ not allowed for this Session
-  workbuddy/deepseek-v4-pro     ❌ not allowed
+workbuddy/deepseek-v4.1-flash — DeepSeek-V4.1-Flash · x0.11  OK 已放行
 ```
 
-**要放开限制**：DSH 设置 → **子智能体** → 「模型选择」→ 勾选"允许 Agent 为子智能体选择模型" + 添加路由。改完**重启 DSH** 生效。
+**这就够了。** 编码者就是 Flash，已在名单里，无需任何配置。
 
-Gemini 4 Argon 走的是独立 provider `antigravity`（agy CLI），模型 id：
-`gemini-4-argon-high` / `gemini-4-argon-medium` / `gemini-4-argon-low`
+### 7.2 千万不要把 Argon 加进子代理白名单
+
+这是最容易犯的错（本项目文档第一版就写错了）。把 `antigravity/gemini-4-argon-*` 加进子代理白名单的后果：
+
+- Argon 可能被当作子代理反复调用，**按 Argon 的价格烧钱**（比 Flash 贵一个数量级）
+- 它本身就能读写文件、跑命令，等于一个失控的贵代理
+- 白名单是给「可以被自动派活的模型」用的，不是给「大脑」用的
+
+**Argon 正确的用法**：坐在会话模型的位置上，思考、派活、验收。它不需要出现在子代理名单里。
+
+### 7.3 什么情况才需要动白名单
+
+只有当「任务卡需要比 Flash 更强的执行者」时才加，例如临时加 `antigravity/gemini-4-argon-low`
+跑一个特别难的子任务，用完立刻删掉。默认状态保持只有 Flash。
+
 
 ---
 
