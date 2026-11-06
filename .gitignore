@@ -4,3 +4,4 @@ lx_backups/
 build/
 dist/
 *.spec
+config/
