@@ -58,41 +58,149 @@ import subprocess
 import tempfile
 import urllib.request
 import urllib.error
+import urllib.parse
+import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-__version__ = '1.0.0'
+__version__ = '1.2.0'
 
 APP_TITLE = 'LX Music 音源一键导入 / 更新工具'
 FONT_FAMILY = 'Microsoft YaHei UI'
 MODE_ADD_LABEL = '导入模式（直接新增）'
 MODE_UPDATE_LABEL = '更新模式（同名更新）'
 
-# ---------------------------------------------------------------- 配色（深色主题）
-PALETTE = dict(
-    bg='#f4f1ea',          # 窗口背景：奶油米白（Claude 风格暖色调）
-    card='#fdfcf8',        # 卡片：暖白
-    card2='#f3e2cc',       # 选中行：暖陶土色，与卡片/悬停明显区分
-    field='#efeae0',       # 输入框 / 列表底
-    border='#e5dccb',
-    hover='#ede3d2',
-    accent='#d97757',      # 陶土橙（Claude 强调色）
-    accent_hover='#c86b4c',
-    green='#4d9d70',
-    warn='#cf8a3a',
-    danger='#c05a48',
-    text='#262220',
-    muted='#7a7164',
-    faint='#a89d8b',
-)
-LOG_COLORS = {
-    'title': '#262220',
-    'info': PALETTE['muted'],
-    'ok': PALETTE['green'],
-    'update': PALETTE['accent'],
-    'warn': PALETTE['warn'],
-    'error': PALETTE['danger'],
+# ---------------------------------------------------------------- 配色与主题
+# 三套主题：暖砂（默认，Claude 风格精调版） / 清风（洛雪绿） / 暗夜
+THEMES = {
+    'claude': {
+        'label': '暖砂',
+        'bg': '#faf9f5',
+        'card': '#ffffff',
+        'card2': '#f0ede4',
+        'field': '#f5f3ee',
+        'border': '#e5e2dc',
+        'hover': '#f2efe9',
+        'accent': '#d97757',
+        'accent_hover': '#c4633f',
+        'green': '#3f8f62',
+        'warn': '#c08532',
+        'danger': '#c0503f',
+        'text': '#141413',
+        'muted': '#6f6a62',
+        'faint': '#a8a29a',
+        'on_accent': '#ffffff',
+    },
+    'green': {
+        'label': '清风',
+        'bg': '#f6faf8',
+        'card': '#ffffff',
+        'card2': '#dcf3e8',
+        'field': '#eef6f2',
+        'border': '#dce8e2',
+        'hover': '#e9f3ee',
+        'accent': '#10b981',
+        'accent_hover': '#0d9c6c',
+        'green': '#0e9f6e',
+        'warn': '#c08532',
+        'danger': '#c0503f',
+        'text': '#0f1f19',
+        'muted': '#5e7168',
+        'faint': '#9cb0a6',
+        'on_accent': '#ffffff',
+    },
+    'dark': {
+        'label': '暗夜',
+        'bg': '#191918',
+        'card': '#242422',
+        'card2': '#33322e',
+        'field': '#1f1f1e',
+        'border': '#3a3936',
+        'hover': '#2e2d2a',
+        'accent': '#e08263',
+        'accent_hover': '#ee9478',
+        'green': '#6fbf8e',
+        'warn': '#d8a657',
+        'danger': '#d9705f',
+        'text': '#edeae4',
+        'muted': '#a7a29a',
+        'faint': '#6e6a64',
+        'on_accent': '#1b1a18',
+    },
 }
+THEME_ORDER = ['claude', 'green', 'dark']
+
+# 当前生效的配色（启动时由 apply_theme 原地填充，界面各处直接引用同一对象）
+PALETTE = dict(THEMES['claude'])
+LOG_COLORS = {}
+
+
+def apply_theme(name):
+    """切换主题：原地更新 PALETTE，保证所有持有引用的地方立即同步。"""
+    name = name if name in THEMES else 'claude'
+    PALETTE.clear()
+    PALETTE.update(THEMES[name])
+    LOG_COLORS.clear()
+    LOG_COLORS.update({
+        'title': PALETTE['text'],
+        'info': PALETTE['muted'],
+        'ok': PALETTE['green'],
+        'update': PALETTE['accent'],
+        'warn': PALETTE['warn'],
+        'error': PALETTE['danger'],
+    })
+    return name
+
+
+apply_theme('claude')
+
+# 界面字号（基准值；可在外观设置里整体放大，解决全屏字太小）
+FONT_BASE = dict(title=18, card=15, base=14, bold=14, small=13, tiny=12, btn=13, log=13)
+UI_SCALE_MIN, UI_SCALE_MAX = 0.85, 1.6
+
+
+def _dpi_scale():
+    """返回系统缩放比例（1.0=100%，1.5=150%）。取不到按 1.0。"""
+    if sys.platform != 'win32':
+        return 1.0
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+        dc = ctypes.windll.user32.GetDC(0)
+        dpi = ctypes.windll.gdi32.GetDeviceCaps(dc, 88)  # LOGPIXELSX
+        ctypes.windll.user32.ReleaseDC(0, dc)
+        if dpi and dpi > 0:
+            return max(1.0, min(2.5, round(float(dpi) / 96.0, 2)))
+    except Exception:
+        pass
+    return 1.0
+
+
+def _ui_scale(v, default=1.0):
+    """把配置里的界面缩放收敛到允许区间。"""
+    try:
+        v = float(v)
+    except Exception:
+        v = default
+    return max(UI_SCALE_MIN, min(UI_SCALE_MAX, v))
+
+
+def _initial_size(scale):
+    """按缩放比例算初始窗口大小，并限制在屏幕内（高 DPI 下不会超屏）。"""
+    w, h = int(1240 * scale), int(820 * scale)
+    try:
+        sw, sh = tk.Tk().winfo_screenwidth(), tk.Tk().winfo_screenheight()
+    except Exception:
+        sw, sh = 1920, 1080
+    return min(w, max(900, sw - 80)), min(h, max(600, sh - 120))
+
+
+def _scale_fonts(scale, spec):
+    """按缩放把字号规格换算成实际像素字号。"""
+    return {k: max(9, int(round(v * scale))) for k, v in spec.items()}
 
 
 class WebCheck(tk.Canvas):
@@ -148,7 +256,7 @@ class WebCheck(tk.Canvas):
             c.create_rectangle(1.5, 1.5, s - 1.5, s - 1.5, fill=fill,
                                outline=outline, width=1)
             c.create_line(5, s / 2 + 0.5, s / 2 - 1, s - 5, s - 5, 5,
-                          fill='#fffaf5', width=2, capstyle=tk.ROUND, joinstyle=tk.ROUND)
+                          fill=PALETTE['on_accent'], width=2, capstyle=tk.ROUND, joinstyle=tk.ROUND)
         else:
             if self._enabled:
                 outline = self._colors['hover'] if self._hover else self._colors['faint']
@@ -182,6 +290,19 @@ def short_path(path, limit=52):
 
 def normalize_name(name):
     return (name or '').strip().casefold()
+
+
+def _raw_crc(text):
+    """脚本原文的校验值，用于判断「同版本但内容变了」。"""
+    return zlib.crc32((text or '').encode('utf-8', 'replace')) & 0xFFFFFFFF
+
+
+def _same_content(compressed, raw):
+    """比较已存压缩脚本与磁盘原文是否同一份（解压后比 CRC）。"""
+    try:
+        return _raw_crc(decompress_script(compressed or '')) == _raw_crc(raw)
+    except Exception:
+        return False
 
 
 def hex_rgb(h):
@@ -418,11 +539,63 @@ def fetch_latest_release(owner, repo, timeout=20):
         raise ConnectionError('网络错误：{}'.format(e.reason))
 
 
+def _open_url(url, timeout=30):
+    req = urllib.request.Request(mirrored_url(url), headers=_GITHUB_HEADERS)
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
 def download_bytes(url, timeout=30):
     """下载 Release 附件（自动跟随跳转；设置了镜像时走镜像前缀）。"""
-    req = urllib.request.Request(mirrored_url(url), headers=_GITHUB_HEADERS)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _open_url(url, timeout) as resp:
         return resp.read()
+
+
+def download_to_file(url, target, on_progress=None, timeout=30, chunk=65536):
+    """流式下载到 target：边下边写盘并回报进度，返回写入字节数。
+    on_progress(done, total)：total 为 0 表示服务器没给 Content-Length。
+    先写 .part 再改名，避免半截文件被当成完整音源。"""
+    tmp = target + '.part'
+    done = 0
+    try:
+        with _open_url(url, timeout) as resp:
+            try:
+                total = int(resp.headers.get('Content-Length') or 0)
+            except Exception:
+                total = 0
+            with open(tmp, 'wb') as fh:
+                while True:
+                    buf = resp.read(chunk)
+                    if not buf:
+                        break
+                    fh.write(buf)
+                    done += len(buf)
+                    if on_progress:
+                        try:
+                            on_progress(done, total)
+                        except Exception:
+                            pass
+        os.replace(tmp, target)
+        return done
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def human_size(n):
+    """字节数转人读字符串（B / KB / MB）。"""
+    try:
+        n = float(n or 0)
+    except Exception:
+        return '?'
+    if n < 1024:
+        return '{:.0f} B'.format(n)
+    if n < 1024 * 1024:
+        return '{:.1f} KB'.format(n / 1024.0)
+    return '{:.1f} MB'.format(n / 1024.0 / 1024.0)
 
 
 def source_assets_of(release):
@@ -613,9 +786,69 @@ DEFAULT_SETTINGS = {
     'keep_history': True,
     'log_enabled': True,
     'log_window': True,
+    'theme': 'claude',
+    'ui_scale': 1.0,
+    'show_log': True,
 }
 
 MIRROR_PLACEHOLDER = '例如 https://ghfast.top'
+
+# 本工具自己的仓库（用于检查软件自身是否有新版本）
+APP_REPO = 'Heccdod/lx-music-source-manager'
+
+# 内置推荐音源：(显示名, 仓库, 目录, 来源, 一句话说明)
+# 全部走 GitHub 仓库订阅，导入后能自动跟进更新，比一次性粘贴直链更省事。
+RECOMMENDED_SOURCES = [
+    ('LX 官方风格源 v7', 'pdone/lx-music-source', 'lx', 'repo', '覆盖面最广，社区主推'),
+    ('星海音源', 'pdone/lx-music-source', 'xinghai', 'repo', '多平台高音质，支持无损'),
+    ('HYW 公益版', 'pdone/lx-music-source', 'hyw', 'repo', '连接速度快，公益维护'),
+    ('长青 SVIP', 'pdone/lx-music-source', 'changqing', 'repo', '支持无损音质'),
+    ('玉宁熙 Pro', 'pdone/lx-music-source', 'yuningxi', 'repo', '综合音质好'),
+    ('六音音源', 'pdone/lx-music-source', 'sixyin', 'repo', '适配新版客户端'),
+    ('Huibq 公益源', 'Huibq/keep-alive', '', 'repo', '经典稳定，最高 320k'),
+    ('星海独立仓库', 'cdyUuu/lx-music-xinghai-source', '', 'repo', '五大平台 128k 至 Hi-Res'),
+    ('汇总归档仓库', 'wzh15802/lxmusic', '', 'repo', '多版本合集，定期归档'),
+]
+
+
+def find_lx_music_path():
+    """探测洛雪音乐桌面版主程序，用于「重启洛雪」按钮。"""
+    local = os.environ.get('LOCALAPPDATA') or ''
+    roaming = os.environ.get('APPDATA') or ''
+    candidates = []
+    for base in (local, roaming, os.environ.get('ProgramFiles') or '',
+                 os.environ.get('ProgramFiles(x86)') or ''):
+        if not base:
+            continue
+        candidates.extend([
+            os.path.join(base, 'Programs', 'lx-music-desktop', 'lx-music-desktop.exe'),
+            os.path.join(base, 'lx-music-desktop', 'lx-music-desktop.exe'),
+            os.path.join(base, 'LX Music', 'lx-music-desktop.exe'),
+            os.path.join(base, 'lx-music-desktop', 'LX Music.exe'),
+        ])
+    for p in candidates:
+        if os.path.isfile(p):
+            return p
+    return ''
+
+
+def running_lx_music_pids():
+    """返回正在运行的洛雪主进程 PID 列表（Windows tasklist 解析）。"""
+    try:
+        out = subprocess.run(['tasklist', '/FI', 'IMAGENAME eq lx-music-desktop.exe', '/FO', 'CSV', '/NH'],
+                             capture_output=True, text=True, timeout=15,
+                             creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0)).stdout
+    except Exception:
+        return []
+    pids = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or 'lx-music-desktop' not in line.lower():
+            continue
+        parts = [p.strip('"') for p in line.split('","')]
+        if len(parts) >= 2 and parts[1].isdigit():
+            pids.append(int(parts[1]))
+    return pids
 
 
 def load_subscriptions():
@@ -976,12 +1209,15 @@ class BaseApp:
         self.checked_candidates = set()
         self.checked_imported = set()
         self.checked_backups = set()
+        self.checked_subs = set()
         self.candidate_filter = ''
         self.import_mode = 'add'
         self.last_folder = os.path.expanduser('~')
         self.subscriptions = load_subscriptions()
         self._current_sub = None
         self._settings_win = None
+        self._dl_state = None
+        self._dl_after = None
         self._load_data()
         self._view_refresh_backups()
         self._view_refresh_subscriptions()
@@ -1070,6 +1306,100 @@ class BaseApp:
             return True
         hay = '{} {} {} {} {}'.format(s.name, s.version, s.author, s.description, s.rel_path).lower()
         return self.candidate_filter in hay
+
+    def _entry_of(self, s):
+        """在已导入列表里找到同名音源（normalize_name 比较）。"""
+        key = normalize_name(s.name)
+        for e in self.entries:
+            if normalize_name(e.get('name')) == key:
+                return e
+        return None
+
+    def _cand_state(self, i):
+        """对比待导入音源与已装版本，返回 (mark, color_key, 说明, should_import)。
+        mark 用于列表行前缀角标，should_import 供「智能勾选」使用。"""
+        s = self.candidates[i]
+        e = self._entry_of(s)
+        if e is None:
+            return ('新', 'accent', '新音源，尚未导入', True)
+        old_v = str(e.get('version') or '')
+        new_v = str(s.version or '')
+        try:
+            cmp = version_key(new_v) > version_key(old_v)
+            same = version_key(new_v) == version_key(old_v)
+        except Exception:
+            cmp = new_v != old_v
+            same = new_v == old_v
+        if same and _same_content(e.get('script'), s.raw):
+            return ('=', 'faint', '已装同版，内容一致', False)
+        if same:
+            return ('↑', 'warn', '版本号相同但脚本内容不同，可覆盖', True)
+        if cmp:
+            return ('↑', 'green', '可升级：已装 v{}'.format(old_v or '?'), True)
+        return ('↓', 'faint', '低于已装 v{}，一般无需导入'.format(old_v or '?'), False)
+
+    def do_smart_select(self):
+        """智能勾选：只勾「新音源」和「可升级」，跳过同版和旧版。"""
+        picked = 0
+        for i in range(len(self.candidates)):
+            if not self._candidate_visible(i):
+                continue
+            if self._cand_state(i)[3]:
+                self.checked_candidates.add(i)
+                picked += 1
+        self._view_refresh_candidates()
+        total = sum(1 for i in range(len(self.candidates)) if self._candidate_visible(i))
+        if picked:
+            self.log('智能勾选：已选中 {} 个需要导入的音源（新音源 / 可升级），跳过 {} 个同版或旧版'.format(
+                picked, max(0, total - picked)), 'ok')
+        else:
+            self.log('智能勾选：当前 {} 个音源都已是同版或更新版本，无需导入'.format(total), 'warn')
+
+    def _toggle_sub(self, i, on):
+        """订阅行复选框：勾中表示参与「更新所选」。"""
+        if on:
+            self.checked_subs.add(i)
+        else:
+            self.checked_subs.discard(i)
+        self._update_sub_buttons()
+
+    def _update_sub_buttons(self):
+        btn = getattr(self, 'btn_sub_update', None)
+        if btn is None:
+            return
+        n = len(self.checked_subs)
+        try:
+            if n:
+                btn.configure(text='更新所选({})'.format(n), width=96)
+            else:
+                btn.configure(text='一键更新', width=76)
+        except Exception:
+            pass
+
+    def do_select_subs_with_update(self):
+        """只勾选检查结果显示「有新版」的订阅。"""
+        self.checked_subs = {i for i, s in enumerate(self.subscriptions)
+                             if s.get('check_state') == 'new'}
+        self._view_refresh_subscriptions()
+        self._update_sub_buttons()
+        if not self.checked_subs:
+            self.log('没有勾中任何订阅：先点「检查更新」看看哪些有新版本', 'warn')
+        else:
+            self.log('已勾选 {} 个有新版可更新的订阅'.format(len(self.checked_subs)), 'ok')
+
+    def _select_subs_by_state(self, state):
+        self.checked_subs = {i for i, s in enumerate(self.subscriptions)
+                             if s.get('check_state') == state}
+        self._view_refresh_subscriptions()
+        self._update_sub_buttons()
+
+    def do_select_all_subs(self, on):
+        if on:
+            self.checked_subs = set(range(len(self.subscriptions)))
+        else:
+            self.checked_subs = set()
+        self._view_refresh_subscriptions()
+        self._update_sub_buttons()
 
     def _on_search(self):
         self.candidate_filter = (self.search_var.get() or '').strip().lower()
@@ -1395,8 +1725,8 @@ class BaseApp:
         tk.Button(btns, text='取消', width=10, bg=C['card'], fg=C['muted'], relief='flat',
                   activebackground=C['hover'], activeforeground=C['text'], font=f_small,
                   command=dlg.destroy).pack(side='left', padx=6)
-        tk.Button(btns, text='添加', width=10, bg=C['accent'], fg='#fffaf5', relief='flat',
-                  activebackground=C['accent_hover'], activeforeground='#fffaf5', font=f_bold,
+        tk.Button(btns, text='添加', width=10, bg=C['accent'], fg=PALETTE['on_accent'], relief='flat',
+                  activebackground=C['accent_hover'], activeforeground=PALETTE['on_accent'], font=f_bold,
                   command=ok).pack(side='left', padx=6)
         e_repo.bind('<Return>', lambda e: ok())
         try:
@@ -1478,18 +1808,31 @@ class BaseApp:
         tip = '正在读取 {} 的仓库目录…'.format(key) if src == 'repo' else '正在查询 {} 的最新 Release…'.format(key)
         self._run_task(fetch, done, tip)
 
-    def do_check_subscriptions(self):
+    def _latest_tag_of(self, sub):
+        """只查版本、不下载：release 源读 Release 标签，repo 源读最后一次提交 sha。"""
+        if (sub.get('source') or 'release').lower() == 'repo':
+            rev, _date = repo_revision(sub['repo'], sub.get('path', ''), sub.get('branch', ''))
+            if rev:
+                return rev
+            _files, ref = fetch_repo_files(sub['repo'], sub.get('path', ''), sub.get('branch', ''))
+            return ref or ''
+        rel = fetch_latest_release(*sub['repo'].split('/'))
+        return rel.get('tag_name', '')
+
+    def do_check_subscriptions(self, quiet=False):
+        """只检查不下载：把结果显示到订阅行（有新版 / 已最新），不改变任何本地文件。"""
         if not self.subscriptions:
-            self._info('提示', '尚未添加任何订阅，请先点「添加订阅」')
+            if not quiet:
+                self._info('提示', '尚未添加任何订阅，请先点「添加订阅」')
             return
-        subs = list(self.subscriptions)
+        picked = [s for i, s in enumerate(self.subscriptions) if i in self.checked_subs]
+        subs = picked or list(self.subscriptions)
 
         def work():
             out = []
             for sub in subs:
                 try:
-                    rel = fetch_latest_release(*sub['repo'].split('/'))
-                    out.append((sub, 'ok', rel.get('tag_name', '?')))
+                    out.append((sub, 'ok', self._latest_tag_of(sub)))
                 except Exception as e:
                     out.append((sub, 'err', str(e)))
             return out
@@ -1498,15 +1841,29 @@ class BaseApp:
             if not ok:
                 self.log('检查订阅失败：{}'.format(payload), 'error')
                 return
+            n_new = 0
             for sub, kind, info in payload:
                 if kind == 'err':
+                    sub['check_state'] = 'error'
                     self.log('「{}」检查失败：{}'.format(sub['repo'], info), 'error')
+                elif not info:
+                    sub['check_state'] = 'error'
+                    self.log('「{}」没有读到版本信息，可能仓库为空或无网络'.format(sub['repo']), 'warn')
                 elif sub.get('last_tag') and info == sub.get('last_tag'):
+                    sub['check_state'] = 'latest'
                     self.log('「{}」已是最新：{}'.format(sub['repo'], info), 'ok')
                 else:
-                    self.log('「{}」发现新版本：最新 {}（本地已用 {}）'.format(sub['repo'], info, sub.get('last_tag') or '无'), 'update')
+                    sub['check_state'] = 'new'
+                    n_new += 1
+                    self.log('「{}」发现新版本：最新 {}（本地已用 {}）'.format(
+                        sub['repo'], info, sub.get('last_tag') or '无'), 'update')
+            self._view_refresh_subscriptions()
+            if n_new:
+                self.log('检查完成：{} 个订阅可更新，点「一键更新」可批量下载导入'.format(n_new), 'title')
+            else:
+                self.log('检查完成：全部订阅均为最新版本', 'title')
 
-        self._run_task(work, done, '正在检查全部订阅…')
+        self._run_task(work, done, '正在检查全部订阅…（只检查，不下载）')
 
     def do_update_subscription(self, sub):
         def work():
@@ -1563,8 +1920,16 @@ class BaseApp:
         if not self.subscriptions:
             self._info('提示', '尚未添加任何订阅，请先点「添加订阅」')
             return
-        subs = list(self.subscriptions)
-        if not self._confirm('一键订阅更新？', '将对 {} 个订阅逐个检查最新 Release，发现新版本自动下载并以「更新模式」导入。'.format(len(subs))):
+        picked = [s for i, s in enumerate(self.subscriptions) if i in self.checked_subs]
+        subs = picked or list(self.subscriptions)
+        if picked:
+            head = '更新所选 {} 个订阅？'.format(len(subs))
+        else:
+            head = '一键订阅更新？（全部 {} 个）'.format(len(subs))
+        msg = ('将逐个检查最新版本，发现新版自动下载并以「更新模式」导入。' + chr(10) + chr(10) +
+               '· 已是最新的会自动跳过' + chr(10) +
+               '· 勾选了「更新所选」时只处理勾中的订阅')
+        if not self._confirm(head, msg):
             return
 
         def work():
@@ -1943,38 +2308,127 @@ class BaseApp:
             time.sleep(2)
         raise ValueError('等待 AB Download Manager 下载超时（{} 秒）'.format(self._DL_WAIT))
 
+    # ---- 下载进度（后台线程只更新 _dl_state，主线程 _poll_dl 负责画到界面） ----
+    def _dl_begin(self, label):
+        self._dl_state = {'label': label, 'done': 0, 'total': 0, 'active': True, 'text': '准备下载…'}
+        self._dl_logged = set()
+        if self._dl_after is None:
+            try:
+                self._dl_after = self.root.after(200, self._dl_tick)
+            except Exception:
+                self._dl_after = None
+
+    def _dl_update(self, done, total):
+        st = getattr(self, '_dl_state', None)
+        if not st:
+            return
+        st['done'] = done
+        st['total'] = total
+        if total:
+            st['text'] = '{}  {:.0%}  ({}/{})'.format(st['label'], min(1.0, done / float(total)),
+                                                      human_size(done), human_size(total))
+        else:
+            st['text'] = '{}  已下载 {}'.format(st['label'], human_size(done))
+
+    def _dl_end(self):
+        st = getattr(self, '_dl_state', None)
+        if st:
+            st['active'] = False
+
+    def _dl_tick(self):
+        """主线程定时把下载进度刷到状态栏；没有活动下载时自动停掉定时器。"""
+        self._dl_after = None
+        st = getattr(self, '_dl_state', None)
+        if not st:
+            try:
+                self._view_set_progress(None, '')
+            except Exception:
+                pass
+            return
+        try:
+            if st.get('active'):
+                total = st['total']
+                frac = (st['done'] / float(total)) if total else 0.0
+                self._view_set_progress(frac, st['text'])
+            else:
+                self._view_set_progress(None, '')
+        except Exception:
+            pass
+        if st.get('active'):
+            try:
+                self._dl_after = self.root.after(200, self._dl_tick)
+            except Exception:
+                self._dl_after = None
+
     def _download_url_to(self, url, target):
         """按设置的下载方式把 url 下载到 target，返回实际使用的下载器名。"""
         mode = (self.settings.get('downloader') or 'auto').lower()
         order = {'builtin': ['builtin'], 'idm': ['idm'], 'abdm': ['abdm'],
                  'auto': ['idm', 'abdm', 'builtin']}.get(mode, ['builtin'])
+        base = os.path.basename(target)
         for kind in order:
             if kind == 'idm' and self.idm_path:
                 try:
+                    self.log('用 IDM 下载 {}…'.format(base), 'info')
+                    self._dl_begin('IDM 下载 ' + base)
                     self._download_by_idm(url, target)
+                    self._dl_end()
+                    self.log('IDM 已下载：{}'.format(base), 'ok')
                     return 'idm'
                 except FileNotFoundError:
                     self.idm_path = None
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._dl_end()
+                    self.log('IDM 下载失败（{}），换下一个下载方式'.format(e), 'warn')
                 continue
             if kind == 'abdm' and self.abdm_path:
                 try:
+                    self.log('用 AB Download Manager 下载 {}…'.format(base), 'info')
+                    self._dl_begin('ABDM 下载 ' + base)
                     self._download_by_abdm(url, target)
+                    self._dl_end()
+                    self.log('ABDM 已下载：{}'.format(base), 'ok')
                     return 'abdm'
                 except FileNotFoundError:
                     self.abdm_path = None
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._dl_end()
+                    self.log('ABDM 下载失败（{}），换下一个下载方式'.format(e), 'warn')
                 continue
             if kind == 'builtin':
-                with open(target, 'wb') as f:
-                    f.write(download_bytes(url))
-                return 'builtin'
+                self.log('开始下载 {}（内置下载器，界面会显示进度）'.format(base), 'info')
+                self._dl_begin('下载 ' + base)
+                last = [-1]
+
+                def on_prog(done, total, _base=base, _last=last):
+                    self._dl_update(done, total)
+                    # 每 25% 写一条日志，让人知道确实在下载
+                    pct = int((done / float(total)) * 100) if total else 0
+                    step = pct // 25
+                    if step != _last[0] and step > 0:
+                        _last[0] = step
+                        self.log('{}：{}%  ({}/{})'.format(_base, pct, human_size(done), human_size(total)), 'info')
+
+                try:
+                    size = download_to_file(url, target, on_progress=on_prog)
+                    self._dl_end()
+                    self.log('下载完成：{}（{}）'.format(base, human_size(size)), 'ok')
+                    return 'builtin'
+                except Exception as e:
+                    self._dl_end()
+                    self.log('内置下载失败：{}：{}'.format(base, e), 'error')
+                    raise
         # 外部下载器都不可用/失败时用内置兜底
-        with open(target, 'wb') as f:
-            f.write(download_bytes(url))
-        return 'builtin'
+        self.log('开始下载 {}（内置下载器兜底）'.format(base), 'info')
+        self._dl_begin('下载 ' + base)
+        try:
+            size = download_to_file(url, target, on_progress=self._dl_update)
+            self._dl_end()
+            self.log('下载完成：{}（{}）'.format(base, human_size(size)), 'ok')
+            return 'builtin'
+        except Exception:
+            self._dl_end()
+            raise
 
     def _download_asset_file(self, asset, subdir):
         """把附件下载到订阅目录并返回本地路径（按设置的下载方式）。"""
@@ -2340,6 +2794,291 @@ class BaseApp:
         d = self._sub_download_dir(sub) if sub else effective_download_dir(self.settings)
         self._open_dir(d)
 
+    # ---------------- 洛雪重启 ----------------
+    def do_restart_lx_music(self):
+        """重启洛雪音乐，让刚导入的音源立即生效。"""
+        exe = self.settings.get('lx_path') or find_lx_music_path()
+        pids = running_lx_music_pids()
+        if not exe and not pids:
+            self._info('未找到洛雪音乐',
+                       '没有探测到洛雪音乐桌面版。\n\n'
+                       '请先启动洛雪音乐，或用下面的「选择洛雪程序」手动指定 lx-music-desktop.exe。')
+            return
+        if pids:
+            if not self._confirm('重启洛雪音乐？',
+                                 '将关闭正在运行的洛雪音乐（进程数 {}）并重新启动，\n'
+                                 '以便让刚导入的音源立即生效。\n\n'
+                                 '如果洛雪里还有未保存的操作，请先取消并手动保存。'.format(len(pids))):
+                return
+            for pid in pids:
+                try:
+                    subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True, timeout=15,
+                                   creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                except Exception:
+                    pass
+            time.sleep(1.5)
+        if not exe:
+            self.log('已关闭洛雪音乐，但没有找到程序路径，请手动启动一次', 'warn')
+            self._info('已关闭洛雪音乐', '已关闭洛雪音乐，但没找到程序所在路径。\n\n请在「外观与行为」里点「选择洛雪程序」指定一次，之后就能一键重启。')
+            return
+        try:
+            subprocess.Popen([exe], close_fds=True)
+            self.log('已重启洛雪音乐，音源已生效：{}'.format(exe), 'ok')
+        except Exception as e:
+            self.log('启动洛雪音乐失败：{}'.format(e), 'error')
+            self._info('启动失败', '无法启动：{}\n\n{}'.format(exe, e))
+
+    # ---------------- 外观：主题 / 字号 ----------------
+    def do_set_theme(self, name):
+        if name == self.settings.get('theme'):
+            return
+        self.settings['theme'] = name if name in THEMES else 'claude'
+        save_settings(self.settings)
+        self.log('已切换配色：{}'.format(THEMES[self.settings['theme']]['label']), 'ok')
+        self._ask_relaunch('配色已保存')
+
+    def do_set_ui_scale(self, value):
+        v = _ui_scale(value, self.settings.get('ui_scale', 1.0))
+        if abs(v - float(self.settings.get('ui_scale') or 1.0)) < 0.01:
+            return
+        self.settings['ui_scale'] = v
+        save_settings(self.settings)
+        self.log('界面字号已调整为 {:.0%}'.format(v), 'ok')
+        self._ask_relaunch('字号已保存')
+
+    def _ask_relaunch(self, what):
+        """外观类设置需要重建界面，问一下要不要现在就重启工具。"""
+        if self._confirm(what, '外观设置需要重开界面才能完全生效。\n\n现在重启工具吗？（正在下载/导入时请选取消）'):
+            self.relaunch_app()
+
+    def relaunch_app(self):
+        """重启本工具自身（保留命令行参数与环境）。"""
+        try:
+            exe = sys.executable
+            args = [exe] + (sys.argv if getattr(sys, 'frozen', False) else [os.path.abspath(__file__)] + sys.argv[1:])
+            subprocess.Popen(args, close_fds=True)
+        except Exception as e:
+            self.log('重启失败：{}'.format(e), 'error')
+            self._info('重启失败', '无法自动重启：{}\n\n请手动关闭并重新打开工具。'.format(e))
+            return
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def set_lx_music_path(self):
+        p = filedialog.askopenfilename(parent=self.root, title='选择 lx-music-desktop.exe',
+                                       filetypes=[('程序', '*.exe'), ('全部文件', '*.*')])
+        if not p:
+            return
+        self.settings['lx_path'] = p
+        save_settings(self.settings)
+        self.log('已指定洛雪音乐程序：{}'.format(p), 'ok')
+        self._view_refresh_settings_row()
+
+    # ---------------- 软件自身更新 ----------------
+    def do_check_app_update(self):
+        """检查本工具是否有新版本（GitHub Release），不涉及音源订阅。"""
+        self.log('正在检查工具自身更新（{}）…'.format(APP_REPO), 'info')
+
+        def work():
+            owner, name = parse_repo_ref(APP_REPO)
+            rel = fetch_latest_release(owner, name)
+            return rel
+
+        def done(ok, payload):
+            if not ok:
+                self._info('检查更新失败', '无法读取发布信息：\n\n{}\n\n当前版本：v{}'.format(payload, __version__))
+                self.log('检查工具更新失败：{}'.format(payload), 'error')
+                return
+            latest = (payload.get('tag_name') or '').strip()
+            try:
+                newer = version_key(latest) > version_key(__version__)
+            except Exception:
+                newer = latest.lstrip('vV') != __version__
+            if not newer:
+                self._info('已是最新版本', '当前版本 v{} 已是最新。\n\n最新发布：{}'.format(__version__, latest or '?'))
+                self.log('工具已是最新版本：v{}'.format(__version__), 'ok')
+                return
+            body = (payload.get('body') or '').strip()
+            assets = [a for a in (payload.get('assets') or [])
+                      if a.get('name', '').lower().endswith('.exe')]
+            lines = ['发现新版本：{}（当前 v{}）'.format(latest, __version__), '']
+            if body:
+                lines.append(short(body, 600))
+                lines.append('')
+            if assets:
+                lines.append('可直接下载：{}'.format(assets[0]['name']))
+            else:
+                lines.append('该版本没有 .exe 附件，将打开 GitHub 发布页。')
+            if self._confirm('发现新版本 ' + latest, '\n'.join(lines)):
+                if assets:
+                    self._download_app_release(assets[0], latest)
+                else:
+                    webbrowser.open(payload.get('html_url') or 'https://github.com/' + APP_REPO + '/releases/latest')
+
+        self._run_task(work, done, '正在检查工具自身更新…')
+
+    def _download_app_release(self, asset, tag):
+        folder = self.settings.get('download_dir') or effective_download_dir(self.settings)
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except Exception:
+            pass
+        target = os.path.join(folder, asset.get('name') or 'update.exe')
+        if os.path.exists(target):
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+
+        def work():
+            self._download_url_to(asset['browser_download_url'], target)
+            return target
+
+        def done(ok, payload):
+            if not ok:
+                self._info('下载失败', '下载新版本失败：\n\n{}'.format(payload))
+                return
+            self.log('新版本已下载：{}'.format(payload), 'ok')
+            if self._confirm('下载完成', '新版本已下载到：\n\n{}\n\n是否打开所在文件夹？'.format(payload)):
+                self._open_dir(os.path.dirname(payload))
+
+        self._run_task(work, done, '正在下载新版本 {}…'.format(tag))
+
+    # ---------------- 推荐音源一键添加 ----------------
+    def _is_recommended_subscribed(self, repo, path):
+        return any(s.get('repo') == repo and (s.get('path') or '') == path
+                   for s in self.subscriptions)
+
+    def do_add_recommended(self):
+        """内置推荐音源：先让用户挑要哪几个，再批量加入订阅。"""
+        picks = self._view_pick_recommended()
+        if not picks:
+            return
+        added = 0
+        for idx in picks:
+            label, repo, path, src, _note = RECOMMENDED_SOURCES[idx]
+            if self._is_recommended_subscribed(repo, path):
+                continue
+            self.subscriptions.append({
+                'repo': repo, 'name': label, 'last_tag': '', 'source': src,
+                'path': path, 'branch': '',
+                'added_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            })
+            added += 1
+            self.log('加入推荐音源：{}（{}）'.format(label, repo), 'ok')
+        if not added:
+            self._info('提示', '选中的推荐音源都已经在订阅列表里了')
+            return
+        save_subscriptions(self.subscriptions)
+        self._view_refresh_subscriptions()
+        self.log('已加入 {} 个推荐音源订阅，正在检查可用版本…'.format(added), 'ok')
+        self.do_check_subscriptions(quiet=True)
+
+    def _view_pick_recommended(self):
+        """推荐音源多选窗口（纯 tk 实现，CTk / ttk 两套界面都能用）。返回选中索引列表。"""
+        C = self.C
+        dlg = tk.Toplevel(self.root)
+        dlg.title('选择推荐音源')
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.grid_columnconfigure(0, weight=1)
+        dlg.grid_rowconfigure(1, weight=1)
+
+        head = tk.Frame(dlg, bg=C['card'])
+        head.grid(row=0, column=0, sticky='ew', padx=12, pady=(12, 6))
+        tk.Label(head, text='内置推荐音源', bg=C['card'], fg=C['text'],
+                 font=self.f_card, anchor='w').pack(fill='x', padx=14, pady=(10, 2))
+        tk.Label(head, text='勾选想订阅的仓库；添加后可在「订阅更新」里检查更新、只更新所选',
+                 bg=C['card'], fg=C['muted'], font=self.f_tiny, anchor='w').pack(fill='x', padx=14, pady=(0, 10))
+
+        holder = tk.Frame(dlg, bg=C['card'])
+        holder.grid(row=1, column=0, sticky='nsew', padx=12, pady=2)
+        body = tk.Frame(holder, bg=C['card'])
+        body.pack(fill='both', expand=True)
+        canvas = tk.Canvas(body, bg=C['card'], highlightthickness=0, bd=0)
+        sb = tk.Scrollbar(body, orient='vertical', command=canvas.yview,
+                          bg=C['card'], troughcolor=C['card2'], activebackground=C['border'],
+                          width=int(10 * self.ui_scale), relief='flat', bd=0)
+        inner = tk.Frame(canvas, bg=C['card'])
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        win = canvas.create_window((0, 0), window=inner, anchor='nw')
+
+        def _fit(_e=None):
+            canvas.configure(scrollregion=canvas.bbox('all'))
+            canvas.itemconfigure(win, width=canvas.winfo_width())
+        inner.bind('<Configure>', _fit)
+        canvas.bind('<Configure>', _fit)
+
+        def _wheel(e):
+            canvas.yview_scroll(int(-e.delta / 120), 'units')
+        canvas.bind('<MouseWheel>', _wheel)
+        inner.bind('<MouseWheel>', _wheel)
+
+        vars_map = {}
+        for i, (label, repo, path, src, note) in enumerate(RECOMMENDED_SOURCES):
+            already = self._is_recommended_subscribed(repo, path)
+            var = tk.BooleanVar(value=not already)
+            vars_map[i] = var
+            row = tk.Frame(inner, bg=C['card'])
+            row.pack(fill='x', padx=6, pady=1)
+            WebCheck(row, variable=var, size=16, colors=C).pack(side='left', padx=(6, 0), pady=6)
+            txt = tk.Frame(row, bg=C['card'])
+            txt.pack(side='left', fill='x', expand=True, padx=(8, 8), pady=4)
+            tk.Label(txt, text=label, bg=C['card'],
+                     fg=C['faint'] if already else C['text'],
+                     font=self.f_bold, anchor='w').pack(fill='x')
+            sub_t = '{}  ·  {}'.format(repo + ('/' + path if path else ''), note)
+            if already:
+                sub_t += '   （已订阅）'
+            tk.Label(txt, text=sub_t, bg=C['card'], fg=C['faint'], font=self.f_tiny,
+                     anchor='w', justify='left', wraplength=int(520 * self.ui_scale)).pack(fill='x')
+
+        def pick_all(on):
+            for i, var in vars_map.items():
+                _l, repo, path, _s, _n = RECOMMENDED_SOURCES[i]
+                var.set(False if self._is_recommended_subscribed(repo, path) else on)
+
+        def mkbtn(parent, text, cmd, primary=False, width=None):
+            kw = dict(text=text, command=cmd, font=self.f_btn, relief='flat', bd=0,
+                      padx=12, pady=5, cursor='hand2',
+                      bg=C['accent'] if primary else C['card2'],
+                      fg=C['on_accent'] if primary else C['text'],
+                      activebackground=C['accent_hover'] if primary else C['hover'],
+                      activeforeground=C['on_accent'] if primary else C['text'])
+            if width:
+                kw['width'] = width
+            return tk.Button(parent, **kw)
+
+        bar = tk.Frame(dlg, bg=C['bg'])
+        bar.grid(row=2, column=0, sticky='ew', padx=12, pady=(4, 12))
+        mkbtn(bar, '全选', lambda: pick_all(True)).pack(side='left', padx=(2, 4))
+        mkbtn(bar, '全不选', lambda: pick_all(False)).pack(side='left')
+        picks = {'v': None}
+
+        def ok():
+            picks['v'] = [i for i, v in vars_map.items() if v.get()]
+            dlg.destroy()
+
+        mkbtn(bar, '取消', dlg.destroy).pack(side='right', padx=(4, 2))
+        mkbtn(bar, '添加所选', ok, primary=True).pack(side='right', padx=4)
+
+        dlg.protocol('WM_DELETE_WINDOW', dlg.destroy)
+        dlg.update_idletasks()
+        try:
+            w = int(660 * self.ui_scale)
+            h = int(600 * self.ui_scale)
+            x = self.root.winfo_rootx() + max(0, (self.root.winfo_width() - w) // 2)
+            y = self.root.winfo_rooty() + max(0, (self.root.winfo_height() - h) // 3)
+            dlg.geometry('{}x{}+{}+{}'.format(w, h, x, y))
+        except Exception:
+            dlg.geometry('660x600')
+        dlg.wait_window()
+        return picks['v']
     def do_delete_subscription(self, sub):
         if not self._confirm('确认删除订阅？', '将删除订阅「{}」。\n\n已下载的音源文件不会被删除。'.format(sub.get('repo'))):
             return
@@ -2511,6 +3250,10 @@ class BaseApp:
     def _view_set_status(self, text):
         raise NotImplementedError
 
+    def _view_set_progress(self, frac, text):
+        """在状态栏显示进度；frac 为 None 表示隐藏进度。"""
+        pass
+
     def _view_refresh_candidates(self):
         raise NotImplementedError
 
@@ -2647,8 +3390,14 @@ class CtkApp(BaseApp):
     def __init__(self, user_api_path=None, backup_dir=None, auto_confirm=False, hidden=False):
         import customtkinter as ctk
         self.ctk = ctk
+        # 先按已保存的主题初始化配色，再建窗口，避免先亮后暗的闪屏
+        _s = load_settings()
+        apply_theme(_s.get('theme') or 'claude')
         self.C = PALETTE
-        # 禁用 CTk 自动 DPI 缩放：固定 1:1 渲染，避免高 DPI 屏上窗口超出屏幕、布局被撑破
+        self.dpi_scale = _dpi_scale()
+        # ui_scale = 用户字号倍数 × 系统 DPI 比例：所有字体/间距/行高都乘它，
+        # 这样 150% 屏上不会出现"字小到看不清"。CTk 自身的自动缩放必须关掉，否则会双重放大。
+        self.ui_scale = _ui_scale(_s.get('ui_scale')) * self.dpi_scale
         try:
             ctk.deactivate_automatic_dpi_awareness()
         except Exception:
@@ -2660,19 +3409,21 @@ class CtkApp(BaseApp):
             pass
         self.animations = not hidden
         self.SmoothFrame = smooth_scrollable_class()
-        self.settings = load_settings()
+        self.settings = _s
         set_mirror(self.settings['mirror'])
         self.use_idm = self.settings['use_idm']
         self.idm_path = find_idm_path()
         self.abdm_path = self.settings.get('abdm_path') or find_abdm_path()
-        ctk.set_appearance_mode('light')
+        dark = (self.settings.get('theme') or 'claude') == 'dark'
+        ctk.set_appearance_mode('dark' if dark else 'light')
         ctk.set_default_color_theme('blue')
         self.root = ctk.CTk(fg_color=self.C['bg'])
         if hidden:
             self.root.withdraw()
         self.root.title(APP_TITLE)
-        self.root.geometry('1220x800')
-        self.root.minsize(1100, 720)
+        w, h = _initial_size(self.ui_scale)
+        self.root.geometry('{}x{}'.format(w, h))
+        self.root.minsize(int(940 * self.ui_scale), int(600 * self.ui_scale))
         self.icon = _make_icon()
         self._icon_small = _make_icon(zoom=1)
         try:
@@ -2681,17 +3432,48 @@ class CtkApp(BaseApp):
             pass
         self.path_label = None
         self.folder_label = None
+        self._resize_after = None
         self._build()
         super().__init__(user_api_path=user_api_path, backup_dir=backup_dir, auto_confirm=auto_confirm)
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
+        # 缩放/最大化后重绘：CTk 的 Canvas 组件在尺寸突变时会留黑块，重排一次即可清掉
+        self.root.bind('<Configure>', self._on_root_configure)
 
     # ---------------- 构建 ----------------
+    def _menu_btn(self, master, text, items, kind='ghost', width=64):
+        """下拉菜单按钮：把低频操作收进菜单，避免一排按钮挤出卡片。"""
+        btn = self._btn(master, text, None, kind=kind, width=width)
+        menu = tk.Menu(btn, tearoff=0, bg=self.C['card'], fg=self.C['text'],
+                       activebackground=self.C['accent'], activeforeground=PALETTE['on_accent'],
+                       font=(FONT_FAMILY, self.font_sizes['small']), borderwidth=1,
+                       relief='flat', bd=1)
+
+        def popup(_e=None):
+            try:
+                x = btn.winfo_rootx()
+                y = btn.winfo_rooty() + btn.winfo_height() + 2
+                menu.tk_popup(x, y)
+            finally:
+                try:
+                    menu.grab_release()
+                except Exception:
+                    pass
+
+        for item in items:
+            if item is None:
+                menu.add_separator()
+            else:
+                label, cb = item
+                menu.add_command(label=label, command=cb)
+        btn.configure(command=popup)
+        return btn
+
     def _btn(self, master, text, command, kind='ghost', width=None):
         cfg = dict(width=width or 92, height=30, corner_radius=6, font=self.f_btn, command=command, text=text)
         if kind == 'primary':
-            cfg.update(fg_color=self.C['accent'], hover_color=self.C['accent_hover'], text_color='#fffaf5')
+            cfg.update(fg_color=self.C['accent'], hover_color=self.C['accent_hover'], text_color=PALETTE['on_accent'])
         elif kind == 'danger':
-            cfg.update(fg_color=self.C['danger'], hover_color='#cf7278', text_color='#fffaf5')
+            cfg.update(fg_color=self.C['danger'], hover_color='#cf7278', text_color=PALETTE['on_accent'])
         else:
             cfg.update(fg_color='transparent', hover_color=self.C['hover'], text_color=self.C['text'],
                        border_width=1, border_color=self.C['border'])
@@ -2699,16 +3481,18 @@ class CtkApp(BaseApp):
 
     def _build(self):
         ctk, C = self.ctk, self.C
-        self.f_title = ctk.CTkFont(family=FONT_FAMILY, size=17, weight='bold')
-        self.f_card = ctk.CTkFont(family=FONT_FAMILY, size=14, weight='bold')
-        self.f_base = ctk.CTkFont(family=FONT_FAMILY, size=13)
-        self.f_bold = ctk.CTkFont(family=FONT_FAMILY, size=13, weight='bold')
-        self.f_small = ctk.CTkFont(family=FONT_FAMILY, size=12)
-        self.f_tiny = ctk.CTkFont(family=FONT_FAMILY, size=11)
-        self.f_btn = ctk.CTkFont(family=FONT_FAMILY, size=13)
-        self.f_log = ctk.CTkFont(family=FONT_FAMILY, size=12)
+        sz = _scale_fonts(self.ui_scale, FONT_BASE)
+        self.font_sizes = sz
+        self.f_title = ctk.CTkFont(family=FONT_FAMILY, size=sz['title'], weight='bold')
+        self.f_card = ctk.CTkFont(family=FONT_FAMILY, size=sz['card'], weight='bold')
+        self.f_base = ctk.CTkFont(family=FONT_FAMILY, size=sz['base'])
+        self.f_bold = ctk.CTkFont(family=FONT_FAMILY, size=sz['bold'], weight='bold')
+        self.f_small = ctk.CTkFont(family=FONT_FAMILY, size=sz['small'])
+        self.f_tiny = ctk.CTkFont(family=FONT_FAMILY, size=sz['tiny'])
+        self.f_btn = ctk.CTkFont(family=FONT_FAMILY, size=sz['btn'])
+        self.f_log = ctk.CTkFont(family=FONT_FAMILY, size=sz['log'])
 
-        self.root.grid_rowconfigure(1, weight=1)
+        self.root.grid_rowconfigure(1, weight=5)
         self.root.grid_columnconfigure(0, weight=1)
 
         # ---------- 顶栏 ----------
@@ -2724,9 +3508,18 @@ class CtkApp(BaseApp):
         self.path_label.grid(row=0, column=2, rowspan=2, sticky='e', padx=(8, 12))
         btns = ctk.CTkFrame(header, fg_color='transparent')
         btns.grid(row=0, column=3, rowspan=2, sticky='e', padx=(0, 14), pady=10)
-        self._btn(btns, '⚙', self.do_open_settings, width=36).pack(side='left', padx=(0, 8))
-        self._btn(btns, '重新定位', self.do_relocate, width=84).pack(side='left', padx=(0, 8))
-        self._btn(btns, '打开数据目录', self.do_open_data_dir, width=100).pack(side='left')
+        self.btn_restart = self._btn(btns, '重启洛雪', self.do_restart_lx_music, kind='primary', width=84)
+        self.btn_restart.pack(side='left', padx=(0, 6))
+        self._btn(btns, '检查更新', self.do_check_app_update, width=80).pack(side='left', padx=(0, 6))
+        self._menu_btn(btns, '设置 ▾', [
+            ('外观与行为…', self.do_open_settings),
+            None,
+            ('重新定位数据文件…', self.do_relocate),
+            ('打开数据目录', self.do_open_data_dir),
+            None,
+            ('检查工具更新', self.do_check_app_update),
+            ('重启工具界面', self.relaunch_app),
+        ], width=76).pack(side='left')
 
         # ---------- 主区 ----------
         main = ctk.CTkFrame(self.root, fg_color='transparent')
@@ -2743,22 +3536,36 @@ class CtkApp(BaseApp):
 
         # ---------- 底部（备份 + 日志） ----------
         bottom = ctk.CTkFrame(self.root, fg_color='transparent')
-        bottom.grid(row=2, column=0, sticky='ew', padx=14, pady=(6, 4))
+        bottom.grid(row=2, column=0, sticky='nsew', padx=14, pady=(6, 4))
+        bottom.grid_rowconfigure(0, weight=1)
+        self.root.grid_rowconfigure(2, weight=1, minsize=int(150 * self.ui_scale))
         bottom.grid_columnconfigure(0, weight=2, uniform='bot')
         bottom.grid_columnconfigure(1, weight=3, uniform='bot')
         bottom.grid_columnconfigure(2, weight=3, uniform='bot')
         self._bottom = bottom
         self._build_bottom(bottom)
 
-        # ---------- 状态栏 ----------
+        # ---------- 状态栏（含下载进度） ----------
         status = ctk.CTkFrame(self.root, fg_color='transparent')
         status.grid(row=3, column=0, sticky='ew', padx=14, pady=(0, 10))
         status.grid_columnconfigure(0, weight=1)
         self.status_var = tk.StringVar(value='')
         ctk.CTkLabel(status, textvariable=self.status_var, font=self.f_tiny, text_color=C['faint'],
                      anchor='w').grid(row=0, column=0, sticky='w')
-        ctk.CTkLabel(status, text='所有写操作前自动备份；修改后需重启 LX Music 生效',
-                     font=self.f_tiny, text_color=C['faint']).grid(row=0, column=1, sticky='e')
+        self.hint_label = ctk.CTkLabel(status, text='所有写操作前自动备份',
+                                       font=self.f_tiny, text_color=C['faint'])
+        self.hint_label.grid(row=0, column=1, sticky='e')
+        # 下载进度条：默认隐藏，下载时出现，能直观看到「正在下载／下载到哪了」
+        self.prog_row = ctk.CTkFrame(self.root, fg_color='transparent')
+        self.prog_row.grid(row=4, column=0, sticky='ew', padx=14, pady=(0, 8))
+        self.prog_row.grid_columnconfigure(0, weight=1)
+        self.prog_bar = ctk.CTkProgressBar(self.prog_row, height=6, corner_radius=3,
+                                           fg_color=C['field'], progress_color=C['accent'])
+        self.prog_bar.set(0)
+        self.prog_bar.grid(row=0, column=0, sticky='ew', padx=(0, 10))
+        self.prog_text = ctk.CTkLabel(self.prog_row, text='', font=self.f_tiny, text_color=C['accent'])
+        self.prog_text.grid(row=0, column=1, sticky='e')
+        self.prog_row.grid_remove()
 
     def _build_left_card(self, card):
         ctk, C = self.ctk, self.C
@@ -2774,11 +3581,12 @@ class CtkApp(BaseApp):
 
         bar = ctk.CTkFrame(card, fg_color='transparent')
         bar.grid(row=1, column=0, sticky='ew', padx=14, pady=(4, 2))
-        self._btn(bar, '选择音源文件夹', self.do_scan_folder, kind='primary', width=122).pack(side='left', padx=(0, 6))
+        self._btn(bar, '选择音源文件夹', self.do_scan_folder, kind='primary', width=126).pack(side='left', padx=(0, 6))
+        self._btn(bar, '智能勾选', self.do_smart_select, width=80).pack(side='left', padx=4)
         self._btn(bar, '全选', lambda: self.do_select_all_candidates(True), width=56).pack(side='left', padx=4)
         self._btn(bar, '全不选', lambda: self.do_select_all_candidates(False), width=62).pack(side='left', padx=4)
-        self._btn(bar, '移除所选', self.do_remove_candidates, width=78).pack(side='left', padx=4)
-        self._btn(bar, '清空列表', self.do_clear_candidates, width=78).pack(side='left', padx=4)
+        self._btn(bar, '移除所选', self.do_remove_candidates, width=80).pack(side='left', padx=4)
+        self._btn(bar, '清空列表', self.do_clear_candidates, width=80).pack(side='left', padx=4)
 
         self.search_var = tk.StringVar()
         self.search_var.trace_add('write', lambda *a: self._on_search())
@@ -2819,9 +3627,10 @@ class CtkApp(BaseApp):
         self.cand_count = ctk.CTkLabel(act, text='', font=self.f_tiny, text_color=C['muted'])
         self.cand_count.pack(side='right')
 
-        ctk.CTkLabel(card, text='提示：全选作用于当前显示的音源（受搜索过滤）；「一键全部」作用于全部待导入音源；双击音源查看详情',
-                     font=self.f_tiny, text_color=C['faint'], anchor='w').grid(
-            row=6, column=0, sticky='w', padx=14, pady=(4, 10))
+        self.cand_hint = ctk.CTkLabel(
+            card, text='提示：「智能勾选」只选新音源与可升级版本，跳过已装同版；双击音源查看详情',
+            font=self.f_tiny, text_color=C['faint'], anchor='w')
+        self.cand_hint.grid(row=6, column=0, sticky='w', padx=14, pady=(4, 10))
 
     def _build_right_card(self, card):
         ctk, C = self.ctk, self.C
@@ -2848,9 +3657,8 @@ class CtkApp(BaseApp):
         act.grid(row=3, column=0, sticky='ew', padx=14, pady=(8, 2))
         self._btn(act, '删除所选', self.do_delete_imported, width=96).pack(side='left', padx=(0, 8))
         self._btn(act, '一键清除全部', self.do_clear_imported, kind='danger', width=120).pack(side='left')
-        ctk.CTkLabel(act, text='勾选后点击删除；双击查看详情', font=self.f_tiny, text_color=C['faint']).pack(side='right')
 
-        ctk.CTkLabel(card, text='提示：修改 user_api.json 后需重启 LX Music 桌面版才会生效',
+        ctk.CTkLabel(card, text='修改 user_api.json 后需重启 LX Music 才会生效',
                      font=self.f_tiny, text_color=C['faint'], anchor='w').grid(
             row=4, column=0, sticky='w', padx=14, pady=(4, 10))
 
@@ -2861,20 +3669,22 @@ class CtkApp(BaseApp):
         bk.grid(row=0, column=0, sticky='nsew', padx=(0, 6))
         self._bk_card = bk
         bk.grid_columnconfigure(0, weight=1)
-        head = ctk.CTkFrame(bk, fg_color='transparent')
-        head.grid(row=0, column=0, sticky='ew', padx=14, pady=(12, 2))
-        head.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(head, text='备份文件', font=self.f_card, text_color=C['text']).grid(row=0, column=0, sticky='w')
-        btns = ctk.CTkFrame(head, fg_color='transparent')
-        btns.grid(row=0, column=1, sticky='e')
-        self._btn(btns, '生成备份', self.do_backup, width=68).pack(side='left', padx=2)
-        self._btn(btns, '还原所选', self.do_restore_backup, kind='primary', width=68).pack(side='left', padx=2)
-        self._btn(btns, '打开文件夹', self.do_open_backup_dir, width=78).pack(side='left', padx=2)
-        self._btn(btns, '删除所选', self.do_delete_backups, width=68).pack(side='left', padx=2)
-        self._btn(btns, '清空备份', self.do_clear_backups, width=68).pack(side='left', padx=2)
-        _bk_holder = tk.Frame(bk, bg=C['card'], height=112)
-        _bk_holder.pack_propagate(False)
-        _bk_holder.grid(row=1, column=0, sticky='ew', padx=10, pady=(2, 10))
+        ctk.CTkLabel(bk, text='备份文件', font=self.f_card, text_color=C['text'], anchor='w').grid(
+            row=0, column=0, sticky='w', padx=14, pady=(12, 2))
+        btns = ctk.CTkFrame(bk, fg_color='transparent')
+        btns.grid(row=1, column=0, sticky='ew', padx=12, pady=(0, 2))
+        self._btn(btns, '生成备份', self.do_backup, width=72).pack(side='left', padx=2)
+        self._btn(btns, '还原所选', self.do_restore_backup, kind='primary', width=72).pack(side='left', padx=2)
+        self._menu_btn(btns, '更多 ▾', [
+            ('打开备份文件夹', self.do_open_backup_dir),
+            None,
+            ('删除所选备份', self.do_delete_backups),
+            ('清空全部备份', self.do_clear_backups),
+        ], width=72).pack(side='left', padx=2)
+        bk.grid_rowconfigure(2, weight=1)
+        _bk_holder = tk.Frame(bk, bg=C['card'], height=int(100 * self.ui_scale))
+        _bk_holder.grid_propagate(False)
+        _bk_holder.grid(row=2, column=0, sticky='nsew', padx=10, pady=(2, 10))
         self.bk_list = self.SmoothFrame(_bk_holder, fg_color=C['card'], corner_radius=0,
                                         scrollbar_button_color=C['border'], scrollbar_button_hover_color=C['faint'])
         self.bk_list.pack(fill='both', expand=True)
@@ -2884,26 +3694,33 @@ class CtkApp(BaseApp):
         sub.grid(row=0, column=1, sticky='nsew', padx=(6, 6))
         self._sub_card = sub
         sub.grid_columnconfigure(0, weight=1)
-        head = ctk.CTkFrame(sub, fg_color='transparent')
-        head.grid(row=0, column=0, sticky='ew', padx=14, pady=(12, 2))
-        head.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(head, text='订阅更新', font=self.f_card, text_color=C['text']).grid(row=0, column=0, sticky='w')
-        btns = ctk.CTkFrame(head, fg_color='transparent')
-        btns.grid(row=0, column=1, sticky='e')
-        self._btn(btns, '添加订阅', self.do_add_subscription, kind='primary', width=66).pack(side='left', padx=2)
-        self._btn(btns, '检查更新', self.do_check_subscriptions, width=66).pack(side='left', padx=2)
-        self._btn(btns, '一键更新', self.do_update_all_subscriptions, width=66).pack(side='left', padx=2)
-        self._btn(btns, '打开目录', self.do_open_download_dir, width=66).pack(side='left', padx=2)
-        _sub_holder = tk.Frame(sub, bg=C['card'], height=112)
-        _sub_holder.pack_propagate(False)
-        _sub_holder.grid(row=1, column=0, sticky='ew', padx=10, pady=(2, 10))
+        ctk.CTkLabel(sub, text='订阅更新', font=self.f_card, text_color=C['text'], anchor='w').grid(
+            row=0, column=0, sticky='w', padx=14, pady=(12, 2))
+        btns = ctk.CTkFrame(sub, fg_color='transparent')
+        btns.grid(row=1, column=0, sticky='ew', padx=12, pady=(0, 2))
+        self._btn(btns, '＋ 添加', self.do_add_subscription, kind='primary', width=64).pack(side='left', padx=2)
+        self._btn(btns, '★ 推荐', self.do_add_recommended, width=64).pack(side='left', padx=2)
+        self._btn(btns, '检查更新', self.do_check_subscriptions, width=76).pack(side='left', padx=2)
+        self.btn_sub_update = self._btn(btns, '一键更新', self.do_update_all_subscriptions, width=76)
+        self.btn_sub_update.pack(side='left', padx=2)
+        self._menu_btn(btns, '选择 ▾', [
+            ('全选', lambda: self.do_select_all_subs(True)),
+            ('全不选', lambda: self.do_select_all_subs(False)),
+            None,
+            ('只勾「有新版」的订阅', self.do_select_subs_with_update),
+            ('勾选全部「已最新」的订阅', lambda: self._select_subs_by_state('latest')),
+        ], width=64).pack(side='left', padx=2)
+        sub.grid_rowconfigure(2, weight=1)
+        _sub_holder = tk.Frame(sub, bg=C['card'], height=int(100 * self.ui_scale))
+        _sub_holder.grid_propagate(False)
+        _sub_holder.grid(row=2, column=0, sticky='nsew', padx=10, pady=(2, 4))
         self.sub_list = self.SmoothFrame(_sub_holder, fg_color=C['card'], corner_radius=0,
                                          scrollbar_button_color=C['border'], scrollbar_button_hover_color=C['faint'])
         self.sub_list.pack(fill='both', expand=True)
         self.sub_rows = {}
 
         setrow = tk.Frame(sub, bg=C['card'])
-        setrow.grid(row=2, column=0, sticky='ew', padx=14, pady=(0, 8))
+        setrow.grid(row=3, column=0, sticky='ew', padx=14, pady=(0, 8))
         tk.Label(setrow, text='镜像', bg=C['card'], fg=C['muted'], font=self.f_tiny).pack(side='left')
         self.mirror_entry = tk.Entry(setrow, bg=C['field'], fg=C['text'],
                                      insertbackground=C['text'], relief='flat', highlightthickness=1,
@@ -2937,14 +3754,16 @@ class CtkApp(BaseApp):
         lg.grid(row=0, column=2, sticky='nsew', padx=(6, 0))
         self._lg_card = lg
         lg.grid_columnconfigure(0, weight=1)
-        head = ctk.CTkFrame(lg, fg_color='transparent')
-        head.grid(row=0, column=0, sticky='ew', padx=14, pady=(12, 2))
-        head.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(head, text='运行日志', font=self.f_card, text_color=C['text']).grid(row=0, column=0, sticky='w')
-        self._btn(head, '清空日志', self.do_clear_log, width=80).grid(row=0, column=1, sticky='e')
-        _lg_holder = tk.Frame(lg, bg=C['field'], height=112)
-        _lg_holder.pack_propagate(False)
-        _lg_holder.grid(row=1, column=0, sticky='ew', padx=10, pady=(2, 10))
+        lghead = ctk.CTkFrame(lg, fg_color='transparent')
+        lghead.grid(row=0, column=0, sticky='ew', padx=14, pady=(12, 2))
+        lghead.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(lghead, text='运行日志', font=self.f_card, text_color=C['text'], anchor='w').grid(
+            row=0, column=0, sticky='w')
+        self._btn(lghead, '清空日志', self.do_clear_log, width=76).grid(row=0, column=1, sticky='e')
+        lg.grid_rowconfigure(1, weight=1)
+        _lg_holder = tk.Frame(lg, bg=C['field'], height=int(100 * self.ui_scale))
+        _lg_holder.grid_propagate(False)
+        _lg_holder.grid(row=1, column=0, sticky='nsew', padx=10, pady=(2, 10))
         self.logbox = ctk.CTkTextbox(_lg_holder, fg_color=C['field'], corner_radius=6, font=self.f_log,
                                      wrap='word', state='disabled')
         self.logbox.pack(fill='both', expand=True)
@@ -2976,14 +3795,18 @@ class CtkApp(BaseApp):
         row_bg = C['card2'] if i in self.checked_candidates else C['card']
         row = tk.Frame(self.cand_list, bg=row_bg, cursor='hand2')
         row.pack(fill='x', padx=6, pady=1)
+        mark, mark_color, mark_tip, _imp = self._cand_state(i)
+        badge = tk.Label(row, text=mark, bg=row_bg, fg=C[mark_color], font=self.f_bold,
+                         anchor='center', width=2, cursor='hand2')
+        badge.pack(side='left', padx=(10, 0), pady=4)
         name = tk.Label(row, text=short(s.name, 24), bg=row_bg, fg=C['text'], font=self.f_bold,
                         anchor='w', cursor='hand2')
-        name.pack(side='left', padx=(10, 8), pady=4)
+        name.pack(side='left', padx=(2, 8), pady=4)
         meta = tk.Label(row, text=self._cand_meta_text(s), bg=row_bg, fg=C['muted'], font=self.f_tiny,
                         anchor='e', cursor='hand2')
         meta.pack(side='right', padx=(8, 10), pady=4)
         self.cand_rows[i] = row
-        for w in (row, name, meta):
+        for w in (row, badge, name, meta):
             w.bind('<Button-1>', lambda e, idx=i: self._cand_toggle(idx))
             w.bind('<Enter>', lambda e, idx=i, frm=row: self._row_enter(frm, idx))
             w.bind('<Leave>', lambda e, idx=i, frm=row: self._row_leave(frm, idx))
@@ -3079,9 +3902,19 @@ class CtkApp(BaseApp):
         self.cand_rows = {}
         self.checked_candidates = {i for i in self.checked_candidates if 0 <= i < len(self.candidates)}
         if not self.candidates:
-            tk.Label(self.cand_list,
-                     text='尚未选择音源文件夹\n\n点击上方「选择音源文件夹」，工具将自动遍历所有子文件夹\n并识别其中的 .js 音源脚本',
-                     bg=C['card'], fg=C['faint'], font=self.f_small, justify='center').pack(pady=40)
+            box = tk.Frame(self.cand_list, bg=C['card'])
+            box.pack(expand=True, pady=16)
+            tk.Label(box, text='还没有待导入的音源', bg=C['card'], fg=C['muted'],
+                     font=self.f_card).pack()
+            tk.Label(box, text='点上方「选择音源文件夹」，自动找出全部 .js 音源',
+                     bg=C['card'], fg=C['faint'], font=self.f_tiny).pack(pady=(6, 10))
+            try:
+                self.ctk.CTkButton(box, text='选择音源文件夹', command=self.do_scan_folder,
+                                   width=140, height=32, corner_radius=7,
+                                   fg_color=C['accent'], hover_color=C['accent_hover'],
+                                   text_color=C['on_accent'], font=self.f_btn).pack(pady=(0, 4))
+            except Exception:
+                pass
         else:
             shown = 0
             for i in range(len(self.candidates)):
@@ -3091,7 +3924,7 @@ class CtkApp(BaseApp):
                 self._build_candidate_row(i)
             if shown == 0:
                 tk.Label(self.cand_list, text='没有匹配「{}」的音源'.format(self.candidate_filter),
-                         bg=C['card'], fg=C['faint'], font=self.f_small).pack(pady=24)
+                         bg=C['card'], fg=C['faint'], font=self.f_small).pack(pady=18)
         self._refresh_count_label()
         self._update_action_buttons()
 
@@ -3102,7 +3935,8 @@ class CtkApp(BaseApp):
         self.imp_rows = {}
         self.checked_imported = {i for i in self.checked_imported if 0 <= i < len(self.entries)}
         if not self.entries:
-            tk.Label(self.imp_list, text='暂无已导入音源', bg=C['card'], fg=C['faint'], font=self.f_small).pack(pady=40)
+            tk.Label(self.imp_list, text='还没有导入任何音源',
+                     bg=C['card'], fg=C['faint'], font=self.f_tiny, wraplength=260).pack(fill='x', pady=20)
         else:
             for i, e in enumerate(self.entries):
                 self._build_imported_row(i, e)
@@ -3116,8 +3950,9 @@ class CtkApp(BaseApp):
         files = self.backups.list_files()
         self.checked_backups = {n for n in self.checked_backups if any(f['name'] == n for f in files)}
         if not files:
-            tk.Label(self.bk_list, text='暂无备份文件（每次写操作前会自动生成）',
-                     bg=C['card'], fg=C['faint'], font=self.f_small).pack(pady=14)
+            tk.Label(self.bk_list, text='暂无备份\n写操作前会自动生成一份',
+                     bg=C['card'], fg=C['faint'], font=self.f_tiny,
+                     justify='center', wraplength=240).pack(fill='x', pady=14)
             return
         for f in files:
             row_bg = C['card2'] if f['name'] in self.checked_backups else C['card']
@@ -3139,15 +3974,28 @@ class CtkApp(BaseApp):
         row_bg = C['card2'] if is_current else C['card']
         row = tk.Frame(self.sub_list, bg=row_bg, cursor='hand2')
         row.pack(fill='x', padx=6, pady=1)
+        var = tk.BooleanVar(value=(i in self.checked_subs))
+        WebCheck(row, variable=var, size=16,
+                 command=lambda idx=i, v=var: self._toggle_sub(idx, v.get())).pack(
+            side='left', padx=(8, 0), pady=5)
         name_l = tk.Label(row, text=short(sub.get('repo', ''), 26), bg=row_bg, fg=C['text'],
                           font=self.f_bold, anchor='w', cursor='hand2')
-        name_l.pack(side='left', padx=(10, 8), pady=4)
+        name_l.pack(side='left', padx=(8, 8), pady=4)
         tag = sub.get('last_tag')
+        state = sub.get('check_state') or ''
+        state_map = {'new': ('有新版', C['accent']), 'latest': ('已最新', C['green']),
+                     'error': ('检查失败', C['danger'])}
+        badge_txt, badge_fg = state_map.get(state, ('', C['faint']))
+        if badge_txt:
+            bd = tk.Label(row, text=badge_txt, bg=row_bg, fg=badge_fg, font=self.f_tiny, cursor='hand2')
+            bd.pack(side='right', padx=(8, 10), pady=4)
+        else:
+            bd = None
         st_l = tk.Label(row, text=self._sub_meta_text(sub), bg=row_bg,
                         fg=C['green'] if tag else C['faint'], font=self.f_tiny, cursor='hand2')
         st_l.pack(side='right', padx=(8, 10), pady=4)
         self.sub_rows[i] = row
-        for w in (row, name_l, st_l):
+        for w in ([row, name_l, st_l] + ([bd] if bd else [])):
             w.bind('<Button-1>', lambda e, s=sub: self.do_show_subscription_sources(s))
             w.bind('<Double-Button-1>', lambda e, s=sub: self.do_update_subscription(s))
             w.bind('<Enter>', lambda e, frm=row, cur=is_current: self._sub_enter(frm, cur))
@@ -3165,10 +4013,26 @@ class CtkApp(BaseApp):
         for w in self.sub_list.winfo_children():
             w.destroy()
         self.sub_rows = {}
+        self.checked_subs = {i for i in self.checked_subs if 0 <= i < len(self.subscriptions)}
         if not self.subscriptions:
-            tk.Label(self.sub_list,
-                     text='暂无订阅\n点「添加订阅」填入 GitHub 仓库（owner/repo）\n单击订阅可把其本地音源加载到「待导入音源」\n双击订阅立即下载并更新',
-                     bg=self.C['card'], fg=self.C['faint'], font=self.f_small, justify='center').pack(pady=14)
+            C = self.C
+            box = tk.Frame(self.sub_list, bg=C['card'])
+            box.pack(expand=True, fill='x', pady=10)
+            tk.Label(box, text='还没有订阅', bg=C['card'], fg=C['muted'],
+                     font=self.f_card).pack()
+            tk.Label(box, text='订阅一个 GitHub 音源仓库，之后就能一键检查并下载更新',
+                     bg=C['card'], fg=C['faint'], font=self.f_tiny,
+                     justify='center', wraplength=320).pack(pady=(6, 8))
+            b1 = self.ctk.CTkButton(box, text='★ 添加推荐音源', command=self.do_add_recommended,
+                                    width=150, height=32, corner_radius=7,
+                                    fg_color=C['accent'], hover_color=C['accent_hover'],
+                                    text_color=C['on_accent'], font=self.f_btn)
+            b1.pack(pady=(0, 4))
+            self.ctk.CTkButton(box, text='手动添加仓库…', command=self.do_add_subscription,
+                               width=150, height=30, corner_radius=7,
+                               fg_color=C['card'], hover_color=C['hover'],
+                               border_width=1, border_color=C['border'],
+                               text_color=C['text'], font=self.f_tiny).pack()
             return
         for i, sub in enumerate(self.subscriptions):
             self._build_sub_row(i, sub)
@@ -3200,7 +4064,7 @@ class CtkApp(BaseApp):
                       fg_color='transparent', border_width=1, border_color=C['border'],
                       text_color=C['muted'], hover_color=C['hover'], command=dlg.destroy).pack(side='left', padx=6)
         ctk.CTkButton(btns, text='确定', width=96, height=32, corner_radius=6, font=self.f_btn,
-                      fg_color=C['accent'], hover_color=C['accent_hover'], text_color='#fffaf5', command=ok).pack(side='left', padx=6)
+                      fg_color=C['accent'], hover_color=C['accent_hover'], text_color=PALETTE['on_accent'], command=ok).pack(side='left', padx=6)
         try:
             dlg.update_idletasks()
             w = max(460, dlg.winfo_reqwidth() + 40)
@@ -3295,8 +4159,50 @@ class CtkApp(BaseApp):
             WebCheck(f, variable=var, command=on_toggle).grid(row=r, column=0, padx=(14, 4), pady=4)
             wlab(f, r, label, 1)
 
-        # ---- 一、备份配置 ----
-        f1 = sec('一、备份配置', 0)
+        # ---- 零、外观与行为 ----
+        f0 = sec('一、外观与行为', 0)
+        wlab(f0, 1, '配色方案', 0)
+        theme_row = ctk.CTkFrame(f0, fg_color='transparent')
+        theme_row.grid(row=1, column=1, columnspan=3, sticky='w', padx=(0, 14), pady=4)
+        self.cfg_theme_var = tk.StringVar(value=THEMES.get(self.settings.get('theme') or 'claude', THEMES['claude'])['label'])
+        self.cfg_theme_menu = ctk.CTkOptionMenu(
+            theme_row, values=[THEMES[k]['label'] for k in THEME_ORDER], variable=self.cfg_theme_var,
+            width=110, height=28, font=self.f_small, dropdown_font=self.f_small,
+            fg_color=C['accent'], button_color=C['accent_hover'], button_hover_color=C['accent_hover'],
+            text_color=PALETTE['on_accent'], dropdown_fg_color=C['card'], dropdown_hover_color=C['card2'],
+            dropdown_text_color=C['text'],
+            command=lambda label: self.do_set_theme(
+                next((k for k in THEME_ORDER if THEMES[k]['label'] == label), 'claude')))
+        self.cfg_theme_menu.pack(side='left')
+        wsub(f0, 2, '暖砂（Claude 风格）、清风（洛雪绿）、暗夜（深色）；切换后建议重启界面')
+
+        wlab(f0, 3, '界面字号', 0)
+        scale_row = ctk.CTkFrame(f0, fg_color='transparent')
+        scale_row.grid(row=3, column=1, columnspan=3, sticky='w', padx=(0, 14), pady=4)
+        self.cfg_scale_var = tk.DoubleVar(value=float(self.settings.get('ui_scale') or 1.0))
+        self.cfg_scale_slider = ctk.CTkSlider(
+            scale_row, from_=UI_SCALE_MIN, to=UI_SCALE_MAX, number_of_steps=15,
+            width=220, height=18, variable=self.cfg_scale_var,
+            fg_color=C['field'], progress_color=C['accent'], button_color=C['accent'],
+            button_hover_color=C['accent_hover'],
+            command=lambda v: self.cfg_scale_label.configure(text='{:.0%}'.format(float(v))))
+        self.cfg_scale_slider.pack(side='left', padx=(0, 10))
+        self.cfg_scale_label = ctk.CTkLabel(scale_row, text='{:.0%}'.format(float(self.cfg_scale_var.get())),
+                                            font=self.f_small, text_color=C['text'], width=46)
+        self.cfg_scale_label.pack(side='left', padx=(0, 10))
+        self._btn(scale_row, '应用', lambda: self.do_set_ui_scale(self.cfg_scale_var.get()), width=72).pack(side='left')
+        wsub(f0, 4, '觉得字太小就调大（最大 160%）；屏幕空间紧张可调小，需重启界面生效')
+
+        wlab(f0, 5, '洛雪程序', 0)
+        self.cfg_lx_label = ctk.CTkLabel(
+            f0, text=short_path(self.settings.get('lx_path') or find_lx_music_path() or '未探测到',
+                                44), font=self.f_tiny, text_color=C['muted'], anchor='w')
+        self.cfg_lx_label.grid(row=5, column=1, columnspan=2, sticky='w', padx=(0, 8), pady=4)
+        self._btn(f0, '选择…', self.set_lx_music_path, width=72).grid(row=5, column=3, sticky='w', padx=(0, 14), pady=4)
+        wsub(f0, 6, '用于顶栏「重启洛雪」按钮；不指定时自动在常见安装位置查找')
+
+        # ---- 二、备份配置 ----
+        f1 = sec('二、备份配置', 1)
         self.cfg_backup_var = tk.BooleanVar(value=self.settings.get('backup_enabled', True))
         wcheck(f1, 1, self.cfg_backup_var, '自动备份（每次写操作前备份；关闭后隐藏备份模块）',
                lambda: self.do_set_backup_enabled(self.cfg_backup_var.get()))
@@ -3307,8 +4213,8 @@ class CtkApp(BaseApp):
                   width=64).grid(row=2, column=2, padx=(0, 14), pady=4)
         wsub(f1, 3, '更改目录时可将旧备份迁移到新位置')
 
-        # ---- 二、订阅配置 ----
-        f2 = sec('二、订阅配置', 1)
+        # ---- 三、订阅配置 ----
+        f2 = sec('三、订阅配置', 2)
         wlab(f2, 1, '下载目录', 0)
         self.cfg_dl_entry = wentry(f2, 1, effective_download_dir(self.settings),
                                    self.do_set_download_dir)
@@ -3347,8 +4253,8 @@ class CtkApp(BaseApp):
         self._btn(f2, '删除订阅', self._delete_cfg_sub, width=84).grid(
             row=6, column=2, sticky='w', padx=(0, 14), pady=(0, 10))
 
-        # ---- 三、日志配置 ----
-        f3 = sec('三、日志配置', 2)
+        # ---- 四、日志配置 ----
+        f3 = sec('四、日志配置', 3)
         self.cfg_log_var = tk.BooleanVar(value=self.settings.get('log_enabled', True))
         self.cfg_log_check = WebCheck(f3, variable=self.cfg_log_var,
                                       command=lambda: self.do_set_log_enabled(self.cfg_log_var.get()))
@@ -3365,8 +4271,9 @@ class CtkApp(BaseApp):
         self._view_refresh_cfg_logwin()
 
         bottom_row = ctk.CTkFrame(win, fg_color='transparent')
-        bottom_row.grid(row=3, column=0, sticky='e', padx=16, pady=12)
-        self._btn(bottom_row, '关闭', self._on_settings_close, width=88).pack(side='left')
+        bottom_row.grid(row=4, column=0, sticky='e', padx=16, pady=12)
+        self._btn(bottom_row, '重启界面', self.relaunch_app, width=92).pack(side='left', padx=(0, 8))
+        self._btn(bottom_row, '关闭', self._on_settings_close, width=88, kind='primary').pack(side='left')
         try:
             win.update_idletasks()
             w = max(620, win.winfo_reqwidth() + 30)
@@ -3429,6 +4336,60 @@ class CtkApp(BaseApp):
     def _view_set_status(self, text):
         self.status_var.set(text)
 
+    def _view_set_progress(self, frac, text):
+        """显示/隐藏下载进度条：frac=None 隐藏；0 表示不确定长度用跑马灯。"""
+        try:
+            if frac is None:
+                try:
+                    self.prog_bar.stop()
+                except Exception:
+                    pass
+                self.prog_row.grid_remove()
+                return
+            self.prog_row.grid()
+            if frac <= 0:
+                self.prog_bar.set(0)
+                self.prog_bar.configure(mode='indeterminate')
+                try:
+                    self.prog_bar.start()
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.prog_bar.stop()
+                except Exception:
+                    pass
+                self.prog_bar.configure(mode='determinate')
+                self.prog_bar.set(min(1.0, max(0.0, frac)))
+            self.prog_text.configure(text=text or '')
+        except Exception:
+            pass
+
+    def _on_root_configure(self, event):
+        """窗口缩放/最大化后重排一次：CTk 的 Canvas 组件在尺寸突变时会留黑块。"""
+        if event.widget is not self.root:
+            return
+        if self._resize_after is not None:
+            try:
+                self.root.after_cancel(self._resize_after)
+            except Exception:
+                pass
+        self._resize_after = self.root.after(140, self._after_resize)
+
+    def _after_resize(self):
+        self._resize_after = None
+        try:
+            self.root.update_idletasks()
+            for name in ('cand_list', 'imp_list', 'bk_list', 'sub_list'):
+                w = getattr(self, name, None)
+                if w is not None:
+                    try:
+                        w._parent_canvas.configure(scrollregion=w._parent_canvas.bbox('all'))
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def _view_confirm(self, title, message, danger=False):
         return self._dialog(title, message, danger=danger, confirm=True)
 
@@ -3458,10 +4419,10 @@ class CtkApp(BaseApp):
             ok_fg = C['danger'] if danger else C['accent']
             ok_hover = '#ad4f3e' if danger else C['accent_hover']
             ctk.CTkButton(btns, text='确定', width=96, height=32, corner_radius=6, font=self.f_btn,
-                          fg_color=ok_fg, hover_color=ok_hover, text_color='#fffaf5', command=ok).pack(side='left', padx=6)
+                          fg_color=ok_fg, hover_color=ok_hover, text_color=PALETTE['on_accent'], command=ok).pack(side='left', padx=6)
         else:
             ctk.CTkButton(btns, text='知道了', width=96, height=32, corner_radius=6, font=self.f_btn,
-                          fg_color=C['accent'], hover_color=C['accent_hover'], text_color='#fffaf5',
+                          fg_color=C['accent'], hover_color=C['accent_hover'], text_color=PALETTE['on_accent'],
                           command=dlg.destroy).pack(side='left', padx=6)
         dlg.protocol('WM_DELETE_WINDOW', dlg.destroy)
         try:
@@ -3521,9 +4482,13 @@ class CtkApp(BaseApp):
 # ---------------------------------------------------------------- tkinter / ttk 回退界面
 class TtkApp(BaseApp):
     def __init__(self, user_api_path=None, backup_dir=None, auto_confirm=False, hidden=False):
+        _s = load_settings()
+        apply_theme(_s.get('theme') or 'claude')
         self.C = PALETTE
+        self.dpi_scale = _dpi_scale()
+        self.ui_scale = _ui_scale(_s.get('ui_scale')) * self.dpi_scale
         self.animations = not hidden
-        self.settings = load_settings()
+        self.settings = _s
         set_mirror(self.settings['mirror'])
         self.use_idm = self.settings['use_idm']
         self.idm_path = find_idm_path()
@@ -3532,8 +4497,9 @@ class TtkApp(BaseApp):
         if hidden:
             self.root.withdraw()
         self.root.title(APP_TITLE)
-        self.root.geometry('1220x800')
-        self.root.minsize(1100, 720)
+        w, h = _initial_size(self.ui_scale)
+        self.root.geometry('{}x{}'.format(w, h))
+        self.root.minsize(int(940 * self.ui_scale), int(600 * self.ui_scale))
         self.root.configure(bg=self.C['bg'])
         self.icon = _make_icon()
         try:
@@ -3555,36 +4521,46 @@ class TtkApp(BaseApp):
             s.theme_use('clam')
         except Exception:
             pass
+        sz = _scale_fonts(self.ui_scale, FONT_BASE)
+        self.font_sizes = sz
+        # ttk 界面用普通元组字体，名字与 CTk 界面保持一致，公共对话框才两边通用
+        self.f_card = (F, sz['card'], 'bold')
+        self.f_bold = (F, sz['bold'], 'bold')
+        self.f_base = (F, sz['base'])
+        self.f_small = (F, sz['small'])
+        self.f_tiny = (F, sz['tiny'])
+        self.f_btn = (F, sz['btn'])
         s.configure('.', background=C['bg'], foreground=C['text'], fieldbackground=C['field'],
                     bordercolor=C['border'], lightcolor=C['border'], darkcolor=C['border'],
-                    troughcolor=C['field'], font=(F, 10))
+                    troughcolor=C['field'], font=(F, sz['small']))
         s.configure('TFrame', background=C['bg'])
         s.configure('Card.TFrame', background=C['card'])
         s.configure('TLabel', background=C['bg'], foreground=C['text'])
         s.configure('Card.TLabel', background=C['card'], foreground=C['text'])
-        s.configure('CardTitle.TLabel', background=C['card'], foreground=C['text'], font=(F, 13, 'bold'))
-        s.configure('Muted.TLabel', background=C['card'], foreground=C['muted'], font=(F, 9))
-        s.configure('Status.TLabel', background=C['bg'], foreground=C['faint'], font=(F, 9))
+        s.configure('CardTitle.TLabel', background=C['card'], foreground=C['text'],
+                    font=(F, sz['card'], 'bold'))
+        s.configure('Muted.TLabel', background=C['card'], foreground=C['muted'], font=(F, sz['tiny']))
+        s.configure('Status.TLabel', background=C['bg'], foreground=C['faint'], font=(F, sz['tiny']))
         s.configure('TButton', background=C['card2'], foreground=C['text'], borderwidth=0,
-                    focusthickness=0, padding=(10, 5), font=(F, 10))
+                    focusthickness=0, padding=(10, 5), font=(F, sz['small']))
         s.map('TButton', background=[('active', C['hover']), ('pressed', C['card2'])],
               foreground=[('active', C['text'])])
-        s.configure('Accent.TButton', background=C['accent'], foreground='#fffaf5', borderwidth=0,
-                    focusthickness=0, padding=(12, 5), font=(F, 10))
+        s.configure('Accent.TButton', background=C['accent'], foreground=PALETTE['on_accent'], borderwidth=0,
+                    focusthickness=0, padding=(12, 5), font=(F, sz['small']))
         s.map('Accent.TButton', background=[('active', C['accent_hover']), ('pressed', C['accent'])],
-              foreground=[('active', '#fffaf5')])
-        s.configure('Danger.TButton', background=C['danger'], foreground='#fffaf5', borderwidth=0,
+              foreground=[('active', PALETTE['on_accent'])])
+        s.configure('Danger.TButton', background=C['danger'], foreground=PALETTE['on_accent'], borderwidth=0,
                     focusthickness=0, padding=(12, 5), font=(F, 10))
-        s.map('Danger.TButton', background=[('active', '#e56a6f')], foreground=[('active', '#fffaf5')])
+        s.map('Danger.TButton', background=[('active', '#e56a6f')], foreground=[('active', PALETTE['on_accent'])])
         s.configure('TEntry', fieldbackground=C['field'], foreground=C['text'], insertcolor=C['text'],
                     bordercolor=C['border'], lightcolor=C['border'], darkcolor=C['border'], padding=5)
         s.configure('Treeview', background=C['field'], fieldbackground=C['field'], foreground=C['text'],
-                    rowheight=26, borderwidth=0, font=(F, 10))
-        s.map('Treeview', background=[('selected', C['accent'])], foreground=[('selected', '#fffaf5')])
+                    rowheight=int(26 * self.ui_scale), borderwidth=0, font=(F, sz['small']))
+        s.map('Treeview', background=[('selected', C['accent'])], foreground=[('selected', PALETTE['on_accent'])])
         s.configure('Treeview.Heading', background=C['card2'], foreground=C['text'], borderwidth=0,
-                    font=(F, 10, 'bold'), padding=4)
+                    font=(F, sz['small'], 'bold'), padding=4)
         s.map('Treeview.Heading', background=[('active', C['hover'])])
-        s.configure('TRadiobutton', background=C['card'], foreground=C['text'], font=(F, 10))
+        s.configure('TRadiobutton', background=C['card'], foreground=C['text'], font=(F, sz['small']))
         s.map('TRadiobutton', background=[('active', C['card'])], indicatorcolor=[('selected', C['accent'])])
         s.configure('TScrollbar', background=C['card2'], troughcolor=C['bg'], bordercolor=C['bg'],
                     arrowcolor=C['muted'])
@@ -3602,9 +4578,11 @@ class TtkApp(BaseApp):
         ttk.Label(header, text='洛雪音乐桌面版 · 自定义音源批量导入、更新、备份与清除', style='Muted.TLabel').grid(row=1, column=0, sticky='w')
         self.path_label = ttk.Label(header, text='', style='Muted.TLabel')
         self.path_label.grid(row=0, column=1, rowspan=2, sticky='e', padx=(8, 10))
-        ttk.Button(header, text='⚙', command=self.do_open_settings, width=4).grid(row=0, column=2, rowspan=2, sticky='e', padx=(0, 4))
-        ttk.Button(header, text='重新定位', command=self.do_relocate).grid(row=0, column=3, rowspan=2, sticky='e', padx=(0, 4))
-        ttk.Button(header, text='打开数据目录', command=self.do_open_data_dir).grid(row=0, column=4, rowspan=2, sticky='e', padx=(4, 0))
+        ttk.Button(header, text='重启洛雪', command=self.do_restart_lx_music).grid(row=0, column=2, rowspan=2, sticky='e', padx=(0, 4))
+        ttk.Button(header, text='检查更新', command=self.do_check_app_update).grid(row=0, column=3, rowspan=2, sticky='e', padx=(0, 4))
+        ttk.Button(header, text='外观设置', command=self.do_open_settings).grid(row=0, column=4, rowspan=2, sticky='e', padx=(0, 4))
+        ttk.Button(header, text='重新定位', command=self.do_relocate).grid(row=0, column=5, rowspan=2, sticky='e', padx=(0, 4))
+        ttk.Button(header, text='打开数据目录', command=self.do_open_data_dir).grid(row=0, column=6, rowspan=2, sticky='e', padx=(4, 0))
 
         main = ttk.Frame(self.root)
         main.grid(row=1, column=0, sticky='nsew', padx=12, pady=4)
@@ -3622,6 +4600,7 @@ class TtkApp(BaseApp):
         bar = ttk.Frame(left, style='Card.TFrame')
         bar.grid(row=1, column=0, columnspan=2, sticky='ew', pady=(6, 2))
         ttk.Button(bar, text='选择音源文件夹', style='Accent.TButton', command=self.do_scan_folder).pack(side='left', padx=(0, 4))
+        ttk.Button(bar, text='智能勾选', command=self.do_smart_select).pack(side='left', padx=2)
         ttk.Button(bar, text='全选', command=lambda: self.do_select_all_candidates(True)).pack(side='left', padx=2)
         ttk.Button(bar, text='全不选', command=lambda: self.do_select_all_candidates(False)).pack(side='left', padx=2)
         ttk.Button(bar, text='移除所选', command=self.do_remove_candidates).pack(side='left', padx=2)
@@ -3717,8 +4696,9 @@ class TtkApp(BaseApp):
         ttk.Button(bbtns, text='删除所选', command=self.do_delete_backups).pack(side='left', padx=2)
         ttk.Button(bbtns, text='清空备份', command=self.do_clear_backups).pack(side='left', padx=2)
         self.bk_box = tk.Listbox(bk, bg=C['field'], fg=C['text'], selectbackground=C['accent'],
-                                 selectforeground='#fffaf5', relief='flat', highlightthickness=0,
-                                 font=(FONT_FAMILY, 9), height=5, selectmode='extended', exportselection=False)
+                                 selectforeground=PALETTE['on_accent'], relief='flat', highlightthickness=0,
+                                 font=(FONT_FAMILY, self.font_sizes['small']), height=5,
+                                 selectmode='extended', exportselection=False)
         self.bk_box.grid(row=1, column=0, sticky='ew', pady=(6, 0))
         self.bk_box.bind('<<ListboxSelect>>', self._on_bk_select)
         sub = ttk.Frame(bottom, style='Card.TFrame', padding=12)
@@ -3730,10 +4710,10 @@ class TtkApp(BaseApp):
         ttk.Label(shead, text='订阅更新', style='CardTitle.TLabel').grid(row=0, column=0, sticky='w')
         sbtns = ttk.Frame(shead, style='Card.TFrame')
         sbtns.grid(row=0, column=1, sticky='e')
-        ttk.Button(sbtns, text='添加订阅', style='Accent.TButton', command=self.do_add_subscription).pack(side='left', padx=2)
-        ttk.Button(sbtns, text='检查更新', command=self.do_check_subscriptions).pack(side='left', padx=2)
+        ttk.Button(sbtns, text='＋ 添加订阅', style='Accent.TButton', command=self.do_add_subscription).pack(side='left', padx=2)
+        ttk.Button(sbtns, text='★ 推荐音源', command=self.do_add_recommended).pack(side='left', padx=2)
+        ttk.Button(sbtns, text='检查（不下载）', command=self.do_check_subscriptions).pack(side='left', padx=2)
         ttk.Button(sbtns, text='一键更新', command=self.do_update_all_subscriptions).pack(side='left', padx=2)
-        ttk.Button(sbtns, text='打开目录', command=self.do_open_download_dir).pack(side='left', padx=2)
         self.sub_tree = ttk.Treeview(sub, columns=('repo', 'st'), show='headings', height=5, selectmode='extended')
         self.sub_tree.heading('repo', text='仓库')
         self.sub_tree.heading('st', text='来源 · 版本')
@@ -4179,7 +5159,7 @@ def _make_icon(zoom=2):
     for d in range(5):
         y0, y1 = 12 - d, 12 + d
         x1 = 8 + 2 * (4 - d)
-        img.put('#fffaf5', to=(8, y0, x1, y1))
+        img.put(PALETTE['on_accent'], to=(8, y0, x1, y1))
     try:
         if zoom and zoom != 1:
             img = img.zoom(zoom, zoom)
@@ -4267,7 +5247,35 @@ def run_selftest(force_ttk=False):
         assert len(_demo['added']) == 1 and _demo['added'][0][0].name == '新源', 'report[added] 应为 (s,) 一元组'
         assert version_key('v9.3') > version_key('v4.1'), '版本号比较异常'
         assert version_key('260925') > version_key('260809'), '日期式版本比较异常'
-        report.append('核心逻辑 OK（扫描/解析/导入/更新/去重/备份/读写）')
+        # 主题体系：三套配色键齐全，切换后 PALETTE 原地同步
+        for _k in THEME_ORDER:
+            assert set(THEMES[_k]) >= set(THEMES['claude']), '主题 {} 缺少配色键'.format(_k)
+        apply_theme('dark')
+        assert PALETTE['bg'] == THEMES['dark']['bg'] and PALETTE['text'] == THEMES['dark']['text']
+        assert LOG_COLORS['error'] == THEMES['dark']['danger']
+        apply_theme('claude')
+        assert PALETTE['bg'] == THEMES['claude']['bg'], '主题回切失败'
+        assert _ui_scale(9) == UI_SCALE_MAX and _ui_scale(0.1) == UI_SCALE_MIN and _ui_scale('1.2') == 1.2
+        assert human_size(2048) == '2.0 KB' and human_size(1536 * 1024) == '1.5 MB'
+        # 智能勾选：新音源要选、同版跳过、更高版本跳过、更低版本可选
+        _lab = dict(name='对比源', version='2.0', author='', description='', homepage='')
+        _cands = [SourceScript('/t/a.js', 'a.js', 'aa', dict(_lab), 'utf-8', False),
+                  SourceScript('/t/b.js', 'b.js', 'bb', dict(_lab, name='新源'), 'utf-8', False),
+                  SourceScript('/t/c.js', 'c.js', 'cc', dict(_lab, name='对比源', version='1.0'), 'utf-8', False)]
+        _ctx = BaseApp.__new__(BaseApp)
+        _ctx.candidates = _cands
+        _ctx.entries = [{'name': '对比源', 'version': '2.0', 'script': compress_script(_cands[0].raw)}]
+        _ctx.candidate_filter = ''
+        _st_a = _ctx._cand_state(0)
+        _st_b = _ctx._cand_state(1)
+        _st_c = _ctx._cand_state(2)
+        assert _st_a[0] == '=' and _st_a[3] is False, '同版应判为无需导入'
+        assert _st_b[0] == '新' and _st_b[3] is True, '新音源应判为需要导入'
+        assert _st_c[0] == '↓' and _st_c[3] is False, '低版本应判为无需导入'
+        _ctx.entries = [{'name': '对比源', 'version': '1.0', 'script': ''}]
+        _st_a2 = _ctx._cand_state(0)
+        assert _st_a2[0] == '↑' and _st_a2[3] is True, '可升级应判为需要导入'
+        report.append('核心逻辑 OK（扫描/解析/导入/更新/去重/备份/读写/主题/智能勾选）')
 
         # ---- 订阅逻辑（本地，无网络） ----
         assert parse_repo_ref('guoyue2010/lxmusic-') == ('guoyue2010', 'lxmusic-')
