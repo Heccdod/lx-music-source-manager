@@ -17,7 +17,8 @@
 
 规划者每次开工都是"新人"。所以：
 
-- 每次新会话，第一件事是**读 `PROJECT.md`**（项目宪法）+ **读任务清单**（见第 4 节）
+- 每次新会话，第一件事是**读 `PROJECT.md`**（项目宪法）+ **读 `TASKS.md`**（任务清单）
+- **必须用同一个回合并行读取这两个文件**，不要先读一个、下一轮再读另一个（省一次完整往返）
 - 不要指望它记得"上次那个 bug 修没修"，要靠文档记录
 - 交接必须**写成文件**，不能只在对话里说
 
@@ -128,6 +129,15 @@ subagent(
 
 **关键**：规划者提供的是**方案**（思路、伪代码、关键行），不是完整文件。
 真正落盘编辑仍由编码者做——这样职责边界清楚，也便于验收。
+
+#### 请求节流铁律（省额度、省时间）
+
+- **严禁轮询**：派发 \`subagent\` 后**不要**循环调用 \`list_agents\` 查状态。子代理结束时 DSH 会**主动通知**规划者，等通知即可。轮询除了烧请求没有任何收益。
+- **严禁试探性调用**：不确定要不要调某个工具时，先想清楚再调。每次工具调用都是一次完整请求。
+- **合并操作**：能一条命令做完的事，不要拆成多条。见第 8 节「验收三件套合一」。
+- **开局单回合**：读 \`PROJECT.md\` + \`TASKS.md\` 必须在同一回合里并行完成（见 1.1）。
+
+> 这些规则的目的是**快和省**，不是"防封"。正常开发流量的请求量远低于任何 API 的配额红线。
 
 ### 3.3 例外：规划者什么时候可以自己写代码
 
@@ -251,27 +261,51 @@ workbuddy/deepseek-v4.1-flash — DeepSeek-V4.1-Flash · x0.11  OK 已放行
 
 ---
 
-## 8. 常用命令速查
+## 8. 常用命令速查（**合并成单次调用**）
+
+> 原则：能一条命令完成的事，绝不拆成多条。每次工具调用都是一次完整请求。
+
+### 8.1 验收三件套合一（规划者用这**一条**）
 
 ```powershell
-# 开发目录
-cd 'C:\Users\28381\Documents\Default Project'
+cd 'C:\Users\28381\Documents\Default Project'; python -m py_compile 'LXmusic一键导入和更新.py'; if ($?) { python 'LXmusic一键导入和更新.py' --selftest }; if ($?) { python 'LXmusic一键导入和更新.py' --selftest --force-ttk }
+```
 
-# 编译 + 自检
+一次拿到：编译结果 + CTk 界面自检 + ttk 界面自检。任一步失败后面的自动跳过。
+
+### 8.2 同步 + 提交 + 推送合一（通过验收后用这**一条**）
+
+```powershell
+Copy-Item 'C:\Users\28381\Documents\Default Project\LXmusic一键导入和更新.py','C:\Users\28381\Documents\Default Project\PROJECT.md','C:\Users\28381\Documents\Default Project\AGENTS.md','C:\Users\28381\Documents\Default Project\TASKS.md' 'C:\Users\28381\Documents\lx-music-source-manager\' -Force; cd 'C:\Users\28381\Documents\lx-music-source-manager'; git add -A; git commit -m "fix: 说明" -m "正文"; git -c http.lowSpeedLimit=2000 -c http.lowSpeedTime=20 push origin main; git log --oneline -1
+```
+
+一次完成：同步文件 + 提交 + 推送 + 显示结果。网络卡顿时 `lowSpeedLimit` 会在 20 秒无进展时放弃，不会干等 5 分钟。
+
+### 8.3 单独排查时用（非验收流程）
+
+```powershell
+# 只看编译
 python -m py_compile 'LXmusic一键导入和更新.py'
-python 'LXmusic一键导入和更新.py' --selftest
+
+# 只看某个界面的自检
 python 'LXmusic一键导入和更新.py' --selftest --force-ttk
 
-# 同步到仓库副本
-Copy-Item 'LXmusic一键导入和更新.py' 'C:\Users\28381\Documents\lx-music-source-manager\' -Force
-Copy-Item 'PROJECT.md','AGENTS.md','TASKS.md' 'C:\Users\28381\Documents\lx-music-source-manager\' -Force
-
-# 提交（带低速保护，避免网络卡 5 分钟）
-cd 'C:\Users\28381\Documents\lx-music-source-manager'
-git add -A
-git commit -m "fix: ..." -m "正文"
-git -c http.lowSpeedLimit=2000 -c http.lowSpeedTime=20 push origin main
+# 查看代码结构
+python -c "import ast,io; t=ast.parse(open(r'LXmusic一键导入和更新.py',encoding='utf-8').read()); print([ (n.name, n.end_lineno-n.lineno+1) for n in t.body if isinstance(n, ast.ClassDef)])"
 ```
+
+### 8.4 一个任务的完整请求预算
+
+| 阶段 | 请求数 |
+|---|---|
+| 开局读档（PROJECT.md + TASKS.md 并行） | 1 |
+| 派活给 Flash | 1 |
+| 中途指点（按需，通常 0-2 次） | 0-2 |
+| 合并验收（8.1） | 1 |
+| 合并提交（8.2） | 1 |
+| **合计** | **4-6 次** |
+
+中间几十次代码读写、调试、跑测试全部在 Flash 通道上完成，Argon 只出现在决策点。
 
 ---
 
