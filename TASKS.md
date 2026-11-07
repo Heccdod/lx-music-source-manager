@@ -48,6 +48,14 @@
 
 ## 已完成
 
+- [x] **TASK-023 修复「仅新增 / 同名更新」拨杆无法真正切换（v1.2.2）**
+  - 用户反馈：「同名新增无法选择」
+  - 根因：`BaseApp._set_mode` 用 `str(value).startswith('更新')` 判断模式，而 `MODE_UPDATE_LABEL = '同名更新'` **不以「更新」开头**，因此点「同名更新」时 UI 高亮变了、`self.import_mode` 却仍然是 `'add'` —— 两档看着能点，实际业务永远走「直接新增」分支，用户感觉「选不了」
+  - 修复：`_set_mode` 判定改为 `('更新' in _v or '同名' in _v)`；`_view_rebuild_live`（切换主题/字号后原地重建）补调 `self._set_mode(saved_mode)`，避免重建后模式回落到 add
+  - 顺带：两档胶囊统一 `self.f_bold` 字体（原先切换时改字号会让按钮宽度跳动、看起来像"点不动"）、加 `cursor='hand2'`、宽度 56/66 → 64/76
+  - 自检新增断言：点「同名更新」后 `import_mode == 'update'` 且按钮文案变「更新所选」；点「仅新增」后回到 `'add'` 且文案「导入所选」；`apply_imports(mode='add')` 对同名不同内容必须追加副本（entries 1 → 2）；ttk 回退界面同样断言两档
+  - 验收：`py_compile` ✓、`--selftest` ✓、`--selftest --force-ttk` ✓；截图确认选中「同名更新」后按钮变「更新所选 / 一键全部更新」
+
 - [x] **TASK-022 主题顺序与命名调整（默认「清风（洛雪）」）+ README 版权保护声明完善 + EXE 打包与 Git 提交**（v1.2.1，commit `8258658`）
   - 调整 `THEME_ORDER = ['green', 'claude', 'ocean', 'dark']` 与四套主题显示名称：`清风（洛雪）` / `暖砂（类Claude）` / `鲸蓝（类Deepseek）` / `星月（暗夜）`
   - 默认主题改为 `green`（`清风（洛雪）`），同步更新 `DEFAULT_SETTINGS['theme']`、`apply_theme` 默认回退值与自检断言

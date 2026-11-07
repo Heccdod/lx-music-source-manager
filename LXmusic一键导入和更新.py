@@ -69,7 +69,7 @@ import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-__version__ = '1.2.1'
+__version__ = '1.2.2'
 
 APP_TITLE = 'LX Music 音源一键导入 / 更新工具'
 FONT_FAMILY = 'Noto Sans SC'
@@ -1800,7 +1800,10 @@ class BaseApp:
 
     # ---------------- 导入 / 更新 ----------------
     def _set_mode(self, value):
-        self.import_mode = 'update' if str(value).startswith('更新') else 'add'
+        # 注意：MODE_UPDATE_LABEL 是「同名更新」，并不以「更新」开头；
+        # 早期用 startswith('更新') 判断会导致「同名更新」永远落到 add 分支。
+        _v = str(value)
+        self.import_mode = 'update' if ('更新' in _v or '同名' in _v) else 'add'
         self._update_action_buttons()
         self.log('导入模式切换为：{}'.format('更新模式（同名更新，无同名则新增）' if self.import_mode == 'update' else '导入模式（直接新增）'), 'info')
 
@@ -4730,15 +4733,15 @@ class CtkApp(BaseApp):
         try:
             if hasattr(self, '_pill_add') and self._pill_add.winfo_exists():
                 self._pill_add.configure(
-                    fg_color=C['card'] if not is_upd else 'transparent',
+                    fg_color=C['card2'] if not is_upd else 'transparent',
+                    hover_color=C['card2'] if not is_upd else C['hover'],
                     text_color=C['accent'] if not is_upd else C['muted'],
-                    font=self.f_bold if not is_upd else self.f_tiny,
                 )
             if hasattr(self, '_pill_upd') and self._pill_upd.winfo_exists():
                 self._pill_upd.configure(
-                    fg_color=C['card'] if is_upd else 'transparent',
+                    fg_color=C['card2'] if is_upd else 'transparent',
+                    hover_color=C['card2'] if is_upd else C['hover'],
                     text_color=C['accent'] if is_upd else C['muted'],
-                    font=self.f_bold if is_upd else self.f_tiny,
                 )
         except Exception:
             pass
@@ -4803,23 +4806,27 @@ class CtkApp(BaseApp):
         # dsh-claude-style 一体式底栏：左侧内凹胶囊模式开关 [仅新增 | 同名更新] + 主操作按钮 + 右侧计数
         act = tk.Frame(card, bg=C['card'])
         act.grid(row=4, column=0, sticky='ew', padx=14, pady=(6, 2))
-        self.mode_var = tk.StringVar(value=MODE_ADD_LABEL)
+        cur_mode_lbl = MODE_UPDATE_LABEL if getattr(self, 'import_mode', 'add') == 'update' else MODE_ADD_LABEL
+        self.mode_var = tk.StringVar(value=cur_mode_lbl)
         pill_h = max(26, int(26 * max(1.0, (self.ui_scale - 1.0) * 0.4 + 1.0)))
         mode_track = ctk.CTkFrame(act, fg_color=C['field'], corner_radius=8,
                                   border_width=1, border_color=C['border'])
         mode_track.pack(side='left', padx=(0, 6))
         self._pill_add = ctk.CTkButton(
-            mode_track, text=MODE_ADD_LABEL, width=56, height=pill_h, corner_radius=6,
-            fg_color=C['card'], hover_color=C['hover'], text_color=C['accent'], font=self.f_bold,
+            mode_track, text=MODE_ADD_LABEL, width=64, height=pill_h, corner_radius=6,
+            fg_color=C['card2'], hover_color=C['card2'], text_color=C['accent'], font=self.f_bold,
+            cursor='hand2',
             command=lambda: self._switch_import_mode(MODE_ADD_LABEL),
         )
         self._pill_add.pack(side='left', padx=(2, 1), pady=2)
         self._pill_upd = ctk.CTkButton(
-            mode_track, text=MODE_UPDATE_LABEL, width=66, height=pill_h, corner_radius=6,
-            fg_color='transparent', hover_color=C['hover'], text_color=C['muted'], font=self.f_tiny,
+            mode_track, text=MODE_UPDATE_LABEL, width=76, height=pill_h, corner_radius=6,
+            fg_color='transparent', hover_color=C['hover'], text_color=C['muted'], font=self.f_bold,
+            cursor='hand2',
             command=lambda: self._switch_import_mode(MODE_UPDATE_LABEL),
         )
         self._pill_upd.pack(side='left', padx=(1, 2), pady=2)
+        self._sync_mode_pills()
 
         self.btn_import_sel = self._btn(act, '导入所选', self.do_import, kind='primary', width=96)
         self.btn_import_sel.pack(side='left', padx=(0, 5))
@@ -5414,6 +5421,7 @@ class CtkApp(BaseApp):
         self._build()
         try:
             self.mode_var.set(saved_mode)
+            self._set_mode(saved_mode)
             self._sync_mode_pills()
             if saved_filter:
                 self.search_entry.delete(0, 'end')
@@ -6978,6 +6986,25 @@ def run_selftest(force_ttk=False):
                     app._view_refresh_subscriptions()
                     app.root.update_idletasks()
                     assert len(app.sub_rows) == 1
+                    # 导入模式胶囊：「仅新增 / 同名更新」两档都必须可选且真正切换业务状态
+                    app._switch_import_mode(MODE_UPDATE_LABEL)
+                    app.root.update_idletasks()
+                    assert app.import_mode == 'update', '「同名更新」未能切换（import_mode=%r）' % app.import_mode
+                    assert app.mode_var.get() == MODE_UPDATE_LABEL
+                    assert app.btn_import_sel.cget('text').startswith('更新所选')
+                    app._switch_import_mode(MODE_ADD_LABEL)
+                    app.root.update_idletasks()
+                    assert app.import_mode == 'add', '「仅新增」未能切换（import_mode=%r）' % app.import_mode
+                    assert app.btn_import_sel.cget('text').startswith('导入所选')
+                    # 同名但内容不同：仅新增模式应真的追加同名副本
+                    _dup_meta = parse_script_meta('/*!' + chr(10) + ' * @name 已存在源' + chr(10)
+                                                  + ' * @version 9.0.0' + chr(10) + ' */' + chr(10) + ';(function(){})()')
+                    _dup = SourceScript('/t/dup.js', 'dup.js', 'zz', _dup_meta, 'utf-8', False)
+                    _ent = [dict(base_entry)]
+                    _r_add = apply_imports(_ent, [_dup], 'add')
+                    assert len(_r_add['added']) == 1 and len(_ent) == 2, '仅新增应追加同名副本'
+                    _r_upd = apply_imports([dict(base_entry)], [_dup], 'update')
+                    assert len(_r_upd['updated']) == 1
                     # 实时主题切换与字号切换测试
                     app.do_set_theme('ocean')
                     app.root.update_idletasks()
@@ -7048,6 +7075,13 @@ def run_selftest(force_ttk=False):
             app2._view_refresh_subscriptions()
             app2.root.update_idletasks()
             assert len(app2.sub_tree.get_children()) == 1
+            # ttk 回退界面：radiobutton 同样要把「同名更新」映射为 update 模式
+            app2.mode_var.set(MODE_UPDATE_LABEL)
+            app2._set_mode(app2.mode_var.get())
+            assert app2.import_mode == 'update', 'ttk 下「同名更新」未生效'
+            app2.mode_var.set(MODE_ADD_LABEL)
+            app2._set_mode(app2.mode_var.get())
+            assert app2.import_mode == 'add', 'ttk 下「仅新增」未生效'
             app2.do_scan_folder(src)
             app2.root.update_idletasks()
             app2.do_import(all_selected=True)
