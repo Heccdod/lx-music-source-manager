@@ -69,7 +69,7 @@ import webbrowser
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-__version__ = '1.2.2'
+__version__ = '1.2.3'
 
 APP_TITLE = 'LX Music 音源一键导入 / 更新工具'
 FONT_FAMILY = 'Noto Sans SC'
@@ -469,9 +469,9 @@ def short(text, n):
 
 
 def version_key(version):
-    """版本号比较键：先比数字序列，再比原字符串（用于同批同名音源取最高版本）。"""
-    text = str(version or '')
-    return ([int(x) for x in re.findall(r'\d+', text)], text)
+    """版本号比较键：剥离前导 v/V 与空白后，先比数字序列，再比规范化文本（消除 'v1.2.2' > '1.2.2' 假阳性）。"""
+    text = re.sub(r'^[vV\s]+', '', str(version or '').strip()).strip()
+    return ([int(x) for x in re.findall(r'\d+', text)], text.lower())
 
 
 def short_path(path, limit=52):
@@ -682,7 +682,8 @@ def parse_script_meta(text, fallback_name=''):
         if info[k] and len(info[k]) > lim:
             info[k] = info[k][:lim] + '...'
     if not info['name']:
-        info['name'] = fallback_name or 'user_api_{}'.format(time.strftime('%Y-%m-%d %H:%M:%S'))
+        fb = re.sub(r'_latest$', '', fallback_name or '', flags=re.IGNORECASE)
+        info['name'] = fb or fallback_name or 'user_api_{}'.format(time.strftime('%Y-%m-%d %H:%M:%S'))
     if not info['version']:
         info['version'] = '1.0.0'
     return info
@@ -838,15 +839,43 @@ def fetch_repo_meta(repo, timeout=20):
         raise ConnectionError('网络错误：{}'.format(e.reason))
 
 
+_PURE_VER_JS_RE = re.compile(r'^[vV]?\d+(?:[._-]\d+)*\.js$', re.IGNORECASE)
+_SKIP_REPO_DIRS = {'node_modules', 'history', 'backup', 'backups', 'old', 'archive', 'archived', 'deprecated'}
+
+
+def _repo_local_filename(item, subpath=''):
+    """为仓库目录模式下的 .js 生成不冲突的本地文件名：
+    例如 pdone/lx-music-source 中各子目录均为 `<dir>/latest.js`，
+    若直接取 basename('latest.js') 会导致所有子目录互相覆盖只剩最后 1 个。"""
+    raw_path = (item.get('path') or item.get('name') or 'source.js').strip('/')
+    sub = (subpath or '').strip('/')
+    if sub and raw_path.startswith(sub + '/'):
+        rel = raw_path[len(sub) + 1:]
+    else:
+        rel = raw_path
+    parts = [p for p in rel.split('/') if p]
+    if not parts:
+        return 'source.js'
+    if len(parts) == 1:
+        return parts[0]
+    prefix = '_'.join(parts[:-1])
+    fname = parts[-1]
+    return '{}_{}'.format(prefix, fname)
+
+
 def fetch_repo_files(repo, subpath='', branch='', timeout=20, max_dirs=40):
-    """列出仓库指定目录下的全部 .js 文件（递归，跳过隐藏目录与 node_modules）。
-    返回 (files, ref)；files 每项含 path / name / size / download_url / _ref。"""
+    """列出仓库指定目录下的最新 .js 音源文件（递归，跳过隐藏目录与历史归档目录）。
+    针对类似 pdone/lx-music-source 的结构（每个音源一个子目录，内含 1.js/2.js/... 历史版本 + latest.js）：
+    - 若同一目录下存在 latest.js，则该目录只取 latest.js，自动跳过同目录的旧历史版本文件；
+    - 若同一目录下存在多个纯版本号命名的 .js（且无 latest.js），只取版本号最高的一个；
+    返回 (files, ref)；files 每项含 path / name / local_name / size / download_url / _ref。"""
     owner, name = parse_repo_ref(repo)
     ref = (branch or '').strip()
     if not ref:
         ref = (fetch_repo_meta(repo, timeout).get('default_branch') or 'main')
     out = []
-    stack = [(subpath or '').strip('/')]
+    clean_sub = (subpath or '').strip('/')
+    stack = [clean_sub]
     seen = 0
     while stack and seen < max_dirs:
         p = stack.pop()
@@ -863,17 +892,29 @@ def fetch_repo_files(repo, subpath='', branch='', timeout=20, max_dirs=40):
             raise ConnectionError('网络错误：{}'.format(e.reason))
         if not isinstance(items, list):
             continue
+        dir_js = []
         for it in items:
             t = it.get('type')
             if t == 'dir':
                 dn = it.get('name', '')
-                if dn.startswith('.') or dn == 'node_modules':
+                if dn.startswith('.') or dn.lower() in _SKIP_REPO_DIRS:
                     continue
                 stack.append(it.get('path', ''))
             elif t == 'file' and it.get('name', '').lower().endswith('.js'):
-                out.append({'path': it.get('path', ''), 'name': it.get('name', ''),
-                            'size': it.get('size', 0), 'download_url': it.get('download_url', ''),
-                            '_ref': ref})
+                entry = {'path': it.get('path', ''), 'name': it.get('name', ''),
+                         'size': it.get('size', 0), 'download_url': it.get('download_url', ''),
+                         '_ref': ref}
+                entry['local_name'] = _repo_local_filename(entry, clean_sub)
+                dir_js.append(entry)
+        if dir_js:
+            latest_only = [f for f in dir_js if f['name'].lower() == 'latest.js']
+            if latest_only:
+                out.extend(latest_only)
+            elif len(dir_js) > 1 and all(_PURE_VER_JS_RE.match(f['name']) for f in dir_js):
+                best = max(dir_js, key=lambda f: version_key(os.path.splitext(f['name'])[0]))
+                out.append(best)
+            else:
+                out.extend(dir_js)
     out.sort(key=lambda x: x['path'])
     return out, ref
 
@@ -2181,7 +2222,9 @@ class BaseApp:
                 elif not info:
                     sub['check_state'] = 'error'
                     self.log('「{}」没有读到版本信息，可能仓库为空或无网络'.format(sub['repo']), 'warn')
-                elif sub.get('last_tag') and info == sub.get('last_tag'):
+                elif sub.get('last_tag') and (
+                        str(info).strip() == str(sub.get('last_tag') or '').strip()
+                        or (re.search(r'\d', str(info)) and version_key(info) == version_key(sub.get('last_tag')))):
                     sub['check_state'] = 'latest'
                     sub['latest_tag'] = info
                     self.log('「{}」已是最新：{}'.format(sub['repo'], info), 'ok')
@@ -2191,6 +2234,7 @@ class BaseApp:
                     n_new += 1
                     self.log('「{}」发现新版本：最新 {}（本地已用 {}）'.format(
                         sub['repo'], info, sub.get('last_tag') or '无'), 'update')
+            save_subscriptions(self.subscriptions)
             self._view_refresh_subscriptions()
             if n_new:
                 self.log('检查完成：{} 个订阅可更新，点「一键更新」可批量下载导入'.format(n_new), 'title')
@@ -2210,6 +2254,10 @@ class BaseApp:
                 return
             kind, tag, subdir, items = payload
             if kind == 'skip':
+                sub['last_tag'] = tag or sub.get('last_tag', '')
+                sub['latest_tag'] = tag or sub.get('latest_tag', '')
+                sub['check_state'] = 'latest'
+                save_subscriptions(self.subscriptions)
                 self.log('「{}」已是最新版本 {}，无需更新'.format(sub['repo'], tag), 'ok')
                 self._view_refresh_subscriptions()
                 return
@@ -2235,6 +2283,8 @@ class BaseApp:
                 for s, err in report['errors']:
                     self.log('失败：{}：{}'.format(s.name, err), 'error')
                 sub['last_tag'] = tag
+                sub['latest_tag'] = tag
+                sub['check_state'] = 'latest'
                 save_subscriptions(self.subscriptions)
                 # 更新后自动把该订阅的最新版本音源加载到「待导入音源」
                 self._current_sub = sub.get('repo')
@@ -2291,10 +2341,14 @@ class BaseApp:
             for item in payload:
                 sub, kind = item[0], item[1]
                 if kind == 'skip':
+                    sub['last_tag'] = item[2] or sub.get('last_tag', '')
+                    sub['latest_tag'] = item[2] or sub.get('latest_tag', '')
+                    sub['check_state'] = 'latest'
                     self.log('「{}」已是最新 {}'.format(sub['repo'], item[2]), 'ok')
                 elif kind == 'noasset':
                     self.log('「{}」v{} 没有 .js / .zip 附件，跳过'.format(sub['repo'], item[2]), 'warn')
                 elif kind == 'err':
+                    sub['check_state'] = 'error'
                     self.log('「{}」检查失败：{}'.format(sub['repo'], item[2]), 'error')
                 else:
                     tag, subdir, items = item[2], item[3], item[4]
@@ -2317,12 +2371,14 @@ class BaseApp:
                     for s, err in report['errors']:
                         self.log('失败：{}：{}'.format(s.name, err), 'error')
                     sub['last_tag'] = tag
+                    sub['latest_tag'] = tag
+                    sub['check_state'] = 'latest'
                     if sub.get('repo') == self._current_sub:
                         self._load_sub_sources(sub, silent=True)
+            save_subscriptions(self.subscriptions)
             if has_new:
                 if not self._save_entries('写入 user_api.json'):
                     return
-                save_subscriptions(self.subscriptions)
                 self._view_refresh_subscriptions()
                 self._view_refresh_imported()
                 self._view_status()
@@ -2805,14 +2861,21 @@ class BaseApp:
         self._download_url_to(asset['browser_download_url'], target)
         return target
 
-    def _download_repo_file(self, repo, item, subdir):
-        """把仓库里的单个 .js 下载到订阅目录（复用 IDM/内置下载逻辑）。"""
+    def _download_repo_file(self, repo, item, subdir, subpath=''):
+        """把仓库里的单个 .js 下载到订阅目录。
+        使用带子目录前缀的 local_name 保存，防止各子目录的 latest.js 互相覆盖；
+        对仓库目录内的轻量 .js 脚本优先走内置多镜像加速直连（避免逐个唤醒十几次 IDM 弹窗），失败再回退通用下载器。"""
         owner, name = parse_repo_ref(repo)
         path = item.get('path', '')
-        fname = os.path.basename(path) or 'source.js'
+        fname = item.get('local_name') or _repo_local_filename(item, subpath) or os.path.basename(path) or 'source.js'
         url = item.get('download_url') or 'https://raw.githubusercontent.com/{}/{}/{}/{}'.format(
             owner, name, item.get('_ref') or 'HEAD', path)
-        return self._download_asset_file({'name': fname, 'browser_download_url': url}, subdir)
+        try:
+            return self._download_direct_with_fallback(
+                {'name': fname, 'filename': fname, 'raw_url': url}, subdir
+            )
+        except Exception:
+            return self._download_asset_file({'name': fname, 'browser_download_url': url}, subdir)
 
     def _fetch_sub_update(self, sub):
         """检查订阅是否有新版本并在后台线程完成下载。
@@ -2820,19 +2883,25 @@ class BaseApp:
         支持两种来源：release（默认，读 Release 附件）与 repo（读仓库目录里的 .js）。"""
         kind = (sub.get('source') or 'release').lower()
         keep = bool(self.settings.get('keep_history', True))
+        subdir = self._sub_download_dir(sub)
         if kind == 'repo':
-            files, ref = fetch_repo_files(sub['repo'], sub.get('path', ''), sub.get('branch', ''))
-            rev, _date = repo_revision(sub['repo'], sub.get('path', ''), sub.get('branch', ''))
+            subpath = sub.get('path', '')
+            files, ref = fetch_repo_files(sub['repo'], subpath, sub.get('branch', ''))
+            rev, _date = repo_revision(sub['repo'], subpath, sub.get('branch', ''))
             tag = rev or ref
             if not files:
                 return ('noasset', tag, None, None)
-            if tag and tag == sub.get('last_tag'):
+            expected_names = {f.get('local_name') or _repo_local_filename(f, subpath) for f in files}
+            local_complete = os.path.isdir(subdir) and all(
+                os.path.isfile(os.path.join(subdir, fn)) for fn in expected_names
+            )
+            if tag and tag == sub.get('last_tag') and local_complete:
                 return ('skip', tag, None, None)
-            subdir = self._sub_download_dir(sub)
             self._archive_previous(subdir, sub.get('last_tag'), keep=keep)
             items = []
             for f in files:
-                items.append((self._download_repo_file(sub['repo'], f, subdir), f['name']))
+                fname = f.get('local_name') or _repo_local_filename(f, subpath)
+                items.append((self._download_repo_file(sub['repo'], f, subdir, subpath), fname))
             return ('new', tag, subdir, items)
         rel = fetch_latest_release(*sub['repo'].split('/'))
         tag = rel.get('tag_name', '')
@@ -2841,7 +2910,6 @@ class BaseApp:
         assets = source_assets_of(rel)
         if not assets:
             return ('noasset', tag, None, None)
-        subdir = self._sub_download_dir(sub)
         self._archive_previous(subdir, sub.get('last_tag'), keep=keep)
         items = []
         for a in assets:
@@ -2923,29 +2991,51 @@ class BaseApp:
                                         not _block_comment(text)))
         return scripts
 
-    def _load_sub_sources(self, sub, silent=False):
-        """把该订阅目录中「最新版本」的音源加载进待导入列表（先移除该订阅的旧条目）。
-        返回 (新增数, 移除数)，目录不存在时返回 None。"""
+    def _load_sub_sources(self, sub, silent=False, clear_others=True):
+        """把该订阅目录中「最新版本」的音源加载进待导入列表。
+        clear_others=True（默认，单击切换订阅或单独加载时）会先清空其它订阅残留的音源，
+        保证左上角「待导入音源」只显示当前订阅的音源；批量加载多订阅时传 clear_others=False。
+        同时按音源名去重（同名多文件只保留最高版本），返回 (新增数, 移除数)。"""
         d = self._sub_download_dir(sub)
         if not os.path.isdir(d):
             if not silent:
                 self._info('提示', '该订阅还没有本地下载\n\n请先点「一键更新」或双击该订阅下载音源。')
             return None
-        base = os.path.normcase(os.path.abspath(d)) + os.sep
-        keep = [s for s in self.candidates
-                if not os.path.normcase(os.path.abspath(s.path)).startswith(base)]
-        removed = len(self.candidates) - len(keep)
-        self.candidates = keep
+        if clear_others:
+            removed = len(self.candidates)
+            self.candidates = []
+        else:
+            base = os.path.normcase(os.path.abspath(d)) + os.sep
+            keep = [s for s in self.candidates
+                    if not os.path.normcase(os.path.abspath(s.path)).startswith(base)]
+            removed = len(self.candidates) - len(keep)
+            self.candidates = keep
         self.checked_candidates = set()
+        scanned = scan_source_folder(d)
+        # 同订阅目录内若有同名多版本文件（如残留历史版本），按名称去重并只保留版本号最高的那个
+        best_by_name = {}
+        for s in scanned:
+            k = normalize_name(s.name)
+            prev = best_by_name.get(k)
+            is_latest_fn = os.path.basename(s.path).lower().endswith('latest.js')
+            prev_latest_fn = os.path.basename(prev.path).lower().endswith('latest.js') if prev else False
+            if prev is None or (version_key(s.version), is_latest_fn) >= (version_key(prev.version), prev_latest_fn):
+                best_by_name[k] = s
+        deduped = sorted(best_by_name.values(), key=lambda x: x.name)
         existing = {os.path.normcase(os.path.abspath(s.path)) for s in self.candidates}
         added = 0
-        for s in scan_source_folder(d):
+        for s in deduped:
             key = os.path.normcase(os.path.abspath(s.path))
             if key in existing:
                 continue
             self.candidates.append(s)
             existing.add(key)
             added += 1
+        if clear_others and hasattr(self, 'folder_label'):
+            try:
+                self.folder_label.configure(text=short('当前订阅：' + (sub.get('repo') or ''), 46))
+            except Exception:
+                pass
         self._view_refresh_candidates()
         return (added, removed)
 
@@ -2968,7 +3058,7 @@ class BaseApp:
                              '（拉取后不会强制全部导入，您可以自由勾选想要的音源再导入）'.format(sub.get('repo'))):
                 self.do_fetch_sub_to_candidates(sub)
             return
-        res = self._load_sub_sources(sub, silent=True)
+        res = self._load_sub_sources(sub, silent=True, clear_others=True)
         if res is None:
             return
         added, removed = res
@@ -3018,8 +3108,13 @@ class BaseApp:
                 self.log('拉取订阅音源失败：{}'.format(payload), 'error')
                 return
             total_loaded = 0
+            single = (len(payload) == 1)
+            if not single:
+                self.candidates = []
+                self.checked_candidates = set()
             for s, kind, tag, sdir, items in payload:
                 if kind == 'err':
+                    s['check_state'] = 'error'
                     self.log('「{}」拉取失败：{}'.format(s['repo'], tag), 'error')
                     continue
                 if kind == 'noasset':
@@ -3037,11 +3132,19 @@ class BaseApp:
                         self.log('「{}」解压失败：{}'.format(s['repo'], e), 'error')
                         continue
                 else:
+                    if tag:
+                        s['last_tag'] = tag
+                        s['latest_tag'] = tag
                     s['check_state'] = 'latest'
                 self._current_sub = s.get('repo')
-                res = self._load_sub_sources(s, silent=True)
+                res = self._load_sub_sources(s, silent=True, clear_others=single)
                 if res:
                     total_loaded += res[0]
+            if not single and hasattr(self, 'folder_label'):
+                try:
+                    self.folder_label.configure(text='当前订阅：已合并 {} 个订阅源'.format(len(payload)))
+                except Exception:
+                    pass
             save_subscriptions(self.subscriptions)
             self._view_refresh_subscriptions()
             if self.candidates:
@@ -3491,14 +3594,13 @@ class BaseApp:
                 self.log('精选单音源一键导入完成（新增 {} / 更新 {} / 跳过 {}），点顶栏「重启洛雪」立即生效！'.format(
                     len(report['added']), len(report['updated']), len(report['skipped'])), 'title')
             else:
-                existing = {os.path.normcase(os.path.abspath(s.path)): idx
-                            for idx, s in enumerate(self.candidates)}
-                for s in scripts:
-                    k = os.path.normcase(os.path.abspath(s.path))
-                    if k in existing:
-                        self.candidates[existing[k]] = s
-                    else:
-                        self.candidates.append(s)
+                self.candidates = list(scripts)
+                self.checked_candidates = set()
+                if hasattr(self, 'folder_label'):
+                    try:
+                        self.folder_label.configure(text='当前来源：★ 官方精选单音源')
+                    except Exception:
+                        pass
                 self._view_refresh_candidates()
                 self.do_smart_select()
                 self.log('已将 {} 个精选单音源拉取到左侧「待导入音源」，并已为您智能勾选，请确认后点击「导入所选」！'.format(
@@ -6904,6 +7006,10 @@ def run_selftest(force_ttk=False):
         assert len(_demo['added']) == 1 and _demo['added'][0][0].name == '新源', 'report[added] 应为 (s,) 一元组'
         assert version_key('v9.3') > version_key('v4.1'), '版本号比较异常'
         assert version_key('260925') > version_key('260809'), '日期式版本比较异常'
+        assert version_key('v1.2.3') == version_key('1.2.3') and not (version_key('v1.2.3') > version_key('1.2.3')), '前导 v 不应触发假阳性新版'
+        assert version_key('vv2.2.1') == version_key('v2.2.1'), '多重前导 v 应归一比较'
+        assert _repo_local_filename({'path': 'sixyin/latest.js'}) == 'sixyin_latest.js'
+        assert _repo_local_filename({'path': 'huibq/latest.js'}) == 'huibq_latest.js'
         # 主题体系：四套配色键齐全，默认清风（洛雪），切换后 PALETTE 原地同步
         assert THEME_ORDER == ['green', 'claude', 'ocean', 'dark'] and DEFAULT_SETTINGS['theme'] == 'green'
         for _k in THEME_ORDER:
@@ -7021,16 +7127,23 @@ def run_selftest(force_ttk=False):
                     wc._on_click(None)
                     assert wc.var.get() is True
                     wc.destroy()
-                    # 单击订阅 → 把本地已下载音源加载进待导入列表
+                    # 单击订阅 → 把本地已下载音源加载进待导入列表；切换订阅时不应残留上一订阅音源
                     subdir = os.path.join(tmp, 'dl', 'a', 'b')
+                    subdir_c = os.path.join(tmp, 'dl', 'c', 'd')
                     os.makedirs(subdir)
+                    os.makedirs(subdir_c)
                     with open(os.path.join(subdir, 'x.js'), 'w', encoding='utf-8') as f:
-                        f.write('/*!\n * @name 订阅源\n * @version 1.0\n */\n;(function(){})()')
+                        f.write('/*!\n * @name 订阅源A\n * @version 1.0\n */\n;(function(){})()')
+                    with open(os.path.join(subdir_c, 'y.js'), 'w', encoding='utf-8') as f:
+                        f.write('/*!\n * @name 订阅源B\n * @version 2.0\n */\n;(function(){})()')
                     app.settings['download_dir'] = os.path.join(tmp, 'dl')
-                    app.subscriptions = [{'repo': 'a/b', 'last_tag': 'v1'}]
+                    app.subscriptions = [{'repo': 'a/b', 'last_tag': 'v1'}, {'repo': 'c/d', 'last_tag': 'v2'}]
                     app.do_show_subscription_sources(app.subscriptions[0])
                     app.root.update_idletasks()
-                    assert len(app.candidates) == 1 and app.candidates[0].name == '订阅源'
+                    assert len(app.candidates) == 1 and app.candidates[0].name == '订阅源A'
+                    app.do_show_subscription_sources(app.subscriptions[1])
+                    app.root.update_idletasks()
+                    assert len(app.candidates) == 1 and app.candidates[0].name == '订阅源B', '切换订阅后不应残留上一个订阅的音源'
                     app.candidates = []
                     # 解压后自动删除原压缩包
                     zbuf = io.BytesIO()

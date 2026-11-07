@@ -48,6 +48,17 @@
 
 ## 已完成
 
+- [x] **TASK-024 修复切换订阅残留旧音源、检查更新假阳性弹窗、pdone 仓库下载全部历史版本及 latest.js 互相覆盖（v1.2.3）**
+  - **解决反馈 1（从 pdone 切换到 guoyue2010 音源库，左上角「待导入音源」还保留着 pdone 的音源）**：
+    - 根因：`_load_sub_sources` 原先只过滤掉「目标订阅自身目录」下的旧条目，保留了其它订阅目录（如 `pdone/lx-music-source`、`recommended_direct`）的条目，导致切换订阅时两个库的音源混在一起（18 + 24 = 42 个）
+    - 修复：`_load_sub_sources(sub, silent=False, clear_others=True)` 默认 `clear_others=True` 清空其它订阅残留音源，确保单击切换订阅或单独更新/拉取时只展示当前订阅的音源；同时按音源名去重保留最高版本，并同步更新左上角 `folder_label` 显示 `当前订阅：<repo>`
+  - **解决反馈 2（检查更新时明明已是最新却仍弹出/提示有新版本）**：
+    - 根因：`version_key(version)` 原先返回 `([1, 2, 2], text)` 未剥离前导 `'v'`，导致 `do_check_app_update` 比较 `version_key('v1.2.2') > version_key('1.2.2')` 时因第二项字符串 `'v1.2.2' > '1.2.2'`（`'v'` ASCII 118 > `'1'` ASCII 49）永远返回 `True`，每次点检查更新都必弹发现新版本；同时 `do_update_subscription` / `do_update_all_subscriptions` 在更新或跳过后未同步写回 `check_state = 'latest'` 与 `latest_tag`
+    - 修复：`version_key` 统一剥离前导 `v/V` 与空白并转小写比较；在检查、更新、拉取挑选全链路同步保存 `last_tag`、`latest_tag` 与 `check_state = 'latest'`
+  - **解决反馈 3（pdone 音源库下载了每一个音源的每个历史版本，且各子目录 latest.js 互相覆盖）**：
+    - 根因：`pdone/lx-music-source` 每个音源子目录下同时存放了历代历史版本（`1.js`, `2.js`, ..., `7.js`）和 `latest.js`，`fetch_repo_files` 不加区分地把所有历史 `.js` 全列出来（共 39 个文件）；同时 `_download_repo_file` 用 `os.path.basename(path)` 扁平保存，导致 16 个子目录的 `latest.js` 全部写成同一个 `latest.js` 互相覆盖，最后目录里只剩 1 个 `latest.js` 和一堆旧历史版本
+    - 修复：`fetch_repo_files` 按目录筛选——同目录下存在 `latest.js` 时只取 `latest.js`（跳过同目录所有历史版本），纯版本号多文件目录只取最高版本，并跳过 `history/backup/old/archive` 目录；新增 `_repo_local_filename` 将 `<dir>/latest.js` 保存为 `<dir>_latest.js`（16 个音源各自独立不覆盖），并优先走内置多镜像加速直连免除逐个弹 IDM
+
 - [x] **TASK-023 修复「仅新增 / 同名更新」拨杆无法真正切换（v1.2.2）**
   - 用户反馈：「同名新增无法选择」
   - 根因：`BaseApp._set_mode` 用 `str(value).startswith('更新')` 判断模式，而 `MODE_UPDATE_LABEL = '同名更新'` **不以「更新」开头**，因此点「同名更新」时 UI 高亮变了、`self.import_mode` 却仍然是 `'add'` —— 两档看着能点，实际业务永远走「直接新增」分支，用户感觉「选不了」
