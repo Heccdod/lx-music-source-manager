@@ -45,7 +45,17 @@
 
 ## 界面预览
 
-![界面预览](exe.png)
+### 默认主题：清风（洛雪）
+
+![清风（洛雪）](exe.png)
+
+### 四套主题一览
+
+| 清风（洛雪 · 默认） | 暖砂（类Claude） |
+| :---: | :---: |
+| ![清风（洛雪）](preview_green.png) | ![暖砂（类Claude）](preview_claude.png) |
+| **鲸蓝（类Deepseek）** | **星月（暗夜）** |
+| ![鲸蓝（类Deepseek）](preview_ocean.png) | ![星月（暗夜）](preview_dark.png) |
 
 ## 使用
 

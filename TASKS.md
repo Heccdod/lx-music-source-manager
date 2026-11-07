@@ -48,7 +48,7 @@
 
 ## 已完成
 
-- [x] **TASK-022 主题顺序与命名调整（默认「清风（洛雪）」）+ README 版权保护声明完善 + EXE 打包与 Git 提交**（v1.2.1）
+- [x] **TASK-022 主题顺序与命名调整（默认「清风（洛雪）」）+ README 版权保护声明完善 + EXE 打包与 Git 提交**（v1.2.1，commit `8258658`）
   - 调整 `THEME_ORDER = ['green', 'claude', 'ocean', 'dark']` 与四套主题显示名称：`清风（洛雪）` / `暖砂（类Claude）` / `鲸蓝（类Deepseek）` / `星月（暗夜）`
   - 默认主题改为 `green`（`清风（洛雪）`），同步更新 `DEFAULT_SETTINGS['theme']`、`apply_theme` 默认回退值与自检断言
   - 更新 `README.md` 与源码头部文档，明确标注非官方开源爱好者作品声明、与洛雪官方/Anthropic/DeepSeek 无关联声明、色彩风格描述性说明及 OFL-1.1 开源字体许可声明
