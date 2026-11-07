@@ -4729,7 +4729,7 @@ class CtkApp(BaseApp):
 
     def _sync_mode_pills(self):
         C = self.C
-        is_upd = (self.import_mode == 'update')
+        is_upd = (getattr(self, 'import_mode', 'add') == 'update')
         try:
             if hasattr(self, '_pill_add') and self._pill_add.winfo_exists():
                 self._pill_add.configure(
